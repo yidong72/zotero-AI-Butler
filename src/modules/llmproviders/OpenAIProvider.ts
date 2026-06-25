@@ -796,7 +796,11 @@ export class OpenAIProvider implements ILlmProvider {
       }
     }
 
-    const payload = { model, input, temperature, stream: true } as any;
+    const payload = { model, input, stream: true } as any;
+    // 仅在显式启用时才发送 temperature；部分新模型（如 NVIDIA Inference 上的
+    // GPT-5 / Claude 4）会拒绝该参数。
+    if (options.temperature !== undefined)
+      payload.temperature = Number(temperature);
     this.applyChatReasoning(payload, model, options);
 
     const chunks: string[] = [];

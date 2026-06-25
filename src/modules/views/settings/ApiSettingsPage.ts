@@ -1833,6 +1833,11 @@ export class ApiSettingsPage {
         apiKeyId: "ollamaApiKey",
         modelId: "ollamaModel",
       },
+      nvinference: {
+        apiUrlId: "nvInferenceApiUrl",
+        apiKeyId: "nvInferenceApiKey",
+        modelId: "nvInferenceModel",
+      },
     };
     const config = configs[keyManagerId];
 
@@ -1943,6 +1948,7 @@ export class ApiSettingsPage {
         openrouter: "openRouterApiKey",
         volcanoark: "volcanoArkApiKey",
         ollama: "ollamaApiKey",
+        nvinference: "nvInferenceApiKey",
       };
       const prefKey = mapping[providerId];
       if (prefKey) {
@@ -2870,6 +2876,7 @@ export class ApiSettingsPage {
    * 映射提供商ID到KeyManagerId
    */
   private mapToKeyManagerId(provider: string): ProviderId {
+    if (provider === "nvinference") return "nvinference";
     if (provider === "google") return "google";
     if (provider === "anthropic") return "anthropic";
     if (provider === "openrouter") return "openrouter";

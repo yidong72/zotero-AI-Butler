@@ -213,6 +213,7 @@ export class LLMService {
 
   static mapToKeyManagerId(providerId: string): ProviderId {
     const id = providerId.toLowerCase();
+    if (id === "nvinference") return "nvinference";
     if (id.includes("gemini") || id === "google") return "google";
     if (id.includes("anthropic") || id.includes("claude")) return "anthropic";
     if (id === "openai-compat") return "openai-compat";
@@ -329,6 +330,17 @@ export class LLMService {
       common.apiUrl = endpoint.apiUrl.trim();
       common.apiKey = endpoint.apiKey.trim();
       common.model = endpoint.model.trim();
+    } else if (id === "nvinference") {
+      // NVIDIA Inference 统一网关：单一端点 + 单一密钥，模型自动路由
+      const keyManagerId = this.mapToKeyManagerId(id);
+      common.apiUrl = (
+        getPref("nvInferenceApiUrl" as any) ||
+        "https://inference-api.nvidia.com"
+      ).replace(/\/$/, "");
+      common.apiKey = ApiKeyManager.getCurrentKey(keyManagerId);
+      common.model = (
+        getPref("nvInferenceModel" as any) || "azure/anthropic/claude-opus-4-8"
+      ).trim();
     } else if (id.includes("gemini") || id === "google") {
       const keyManagerId = this.mapToKeyManagerId(id);
       common.apiUrl = (

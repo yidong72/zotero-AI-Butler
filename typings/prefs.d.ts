@@ -8,6 +8,9 @@ declare namespace _ZoteroTypes {
   interface Prefs {
     PluginPrefsMap: {
       "provider": string;
+      "nvInferenceApiUrl": string;
+      "nvInferenceApiKey": string;
+      "nvInferenceModel": string;
       "openaiApiKey": string;
       "openaiApiUrl": string;
       "openaiApiModel": string;
@@ -64,6 +67,10 @@ declare namespace _ZoteroTypes {
       "scanInterval": string;
       "pdfProcessMode": string;
       "pdfAttachmentMode": string;
+      "imageSummaryRequestMode": string;
+      "imageSummaryApiUrl": string;
+      "imageSummaryApiKey": string;
+      "imageSummaryModel": string;
       "imageSummaryCustomHeaders": string;
       "imageSummaryRequestTimeoutSeconds": string;
       "imageSummaryAspectRatioEnabled": boolean;

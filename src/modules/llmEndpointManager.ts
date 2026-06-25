@@ -78,6 +78,12 @@ const PROVIDER_DEFAULTS: Record<LLMEndpointProviderType, ProviderDefaults> = {
     model: "llama3.2",
     reasoningEffort: "default",
   },
+  nvinference: {
+    label: "NVIDIA Inference (Claude + GPT 自动路由)",
+    apiUrl: "https://inference-api.nvidia.com",
+    model: "azure/anthropic/claude-opus-4-8",
+    reasoningEffort: "default",
+  },
 };
 
 const PROVIDER_TYPES = Object.keys(
@@ -100,6 +106,7 @@ function safeProviderType(raw: unknown): LLMEndpointProviderType {
   if (value.includes("gemini")) return "google";
   if (value.includes("claude")) return "anthropic";
   if (value.includes("ollama")) return "ollama";
+  if (value === "nvinference" || value.includes("nvidia")) return "nvinference";
   if (PROVIDER_TYPES.includes(value as LLMEndpointProviderType)) {
     return value as LLMEndpointProviderType;
   }
@@ -482,6 +489,7 @@ export class LLMEndpointManager {
       openrouter: "openRouterApiUrl",
       volcanoark: "volcanoArkApiUrl",
       ollama: "ollamaApiUrl",
+      nvinference: "nvInferenceApiUrl",
     };
     return String(getPref(keyByProvider[providerType] as any) || "").trim();
   }
@@ -497,6 +505,7 @@ export class LLMEndpointManager {
       openrouter: "openRouterApiKey",
       volcanoark: "volcanoArkApiKey",
       ollama: "ollamaApiKey",
+      nvinference: "nvInferenceApiKey",
     };
     const value = String(getPref(keyByProvider[providerType] as any) || "");
     if (providerType === "openai-compat" && !value.trim()) {
@@ -514,6 +523,7 @@ export class LLMEndpointManager {
       openrouter: "openRouterModel",
       volcanoark: "volcanoArkModel",
       ollama: "ollamaModel",
+      nvinference: "nvInferenceModel",
     };
     const value = String(getPref(keyByProvider[providerType] as any) || "");
     if (providerType === "openai-compat" && !value.trim()) {

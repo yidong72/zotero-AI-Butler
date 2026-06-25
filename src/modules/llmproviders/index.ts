@@ -10,3 +10,4 @@ export { default as AnthropicProvider } from "./AnthropicProvider";
 export { default as OpenRouterProvider } from "./OpenRouterProvider";
 export { default as VolcanoArkProvider } from "./VolcanoArkProvider";
 export { default as OllamaProvider } from "./OllamaProvider";
+export { default as NvInferenceProvider } from "./NvInferenceProvider";

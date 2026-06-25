@@ -6,7 +6,11 @@
  */
 
 // ==================== API 配置 ====================
-pref("__prefsPrefix__.provider", "openai-compat");
+pref("__prefsPrefix__.provider", "nvinference");
+// NVIDIA Inference 统一网关：单端点托管 Claude / GPT，模型按名称自动路由
+pref("__prefsPrefix__.nvInferenceApiUrl", "https://inference-api.nvidia.com");
+pref("__prefsPrefix__.nvInferenceApiKey", "");
+pref("__prefsPrefix__.nvInferenceModel", "azure/anthropic/claude-opus-4-8");
 pref("__prefsPrefix__.openaiApiKey", "");
 pref("__prefsPrefix__.openaiApiUrl", "https://api.openai.com/v1/responses");
 pref("__prefsPrefix__.openaiApiModel", "gpt-3.5-turbo");
@@ -88,6 +92,14 @@ pref("__prefsPrefix__.pdfProcessMode", "base64"); // "text"、"base64" 或 "mine
 pref("__prefsPrefix__.pdfAttachmentMode", "default"); // "default" 或 "all"
 
 // ==================== 一图总结配置 ====================
+// 默认走 NVIDIA Inference 的生图 API（OpenAI 兼容 /v1/images/generations，gpt-image-2）
+pref("__prefsPrefix__.imageSummaryRequestMode", "openai"); // "openai" | "gemini"
+pref(
+  "__prefsPrefix__.imageSummaryApiUrl",
+  "https://inference-api.nvidia.com/v1/images/generations",
+);
+pref("__prefsPrefix__.imageSummaryApiKey", "");
+pref("__prefsPrefix__.imageSummaryModel", "openai/openai/gpt-image-2");
 pref("__prefsPrefix__.imageSummaryCustomHeaders", ""); // 额外请求 Headers，JSON/Python dict 对象字符串
 pref("__prefsPrefix__.imageSummaryRequestTimeoutSeconds", "600"); // 生图请求超时，默认10分钟
 pref("__prefsPrefix__.imageSummaryAspectRatioEnabled", false); // 是否发送宽高比/size 参数

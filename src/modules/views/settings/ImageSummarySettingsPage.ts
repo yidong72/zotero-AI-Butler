@@ -57,7 +57,7 @@ export class ImageSummarySettingsPage {
 
     // 功能说明
     const notice = createNotice(
-      "📝 <strong>功能说明</strong>：一图总结使用生图模型 (默认 gemini-3-pro-image-preview) 为论文生成学术概念海报，支持 Gemini 原生接口与 OpenAI 兼容接口两种请求方式。",
+      "📝 <strong>功能说明</strong>：一图总结使用生图模型 (默认 NVIDIA Inference gpt-image-2) 为论文生成学术概念海报，支持 Gemini 原生接口与 OpenAI 兼容接口两种请求方式。",
       "info",
     );
     this.container.appendChild(notice);

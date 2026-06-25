@@ -20,7 +20,8 @@ export type ProviderId =
   | "anthropic"
   | "openrouter"
   | "volcanoark"
-  | "ollama";
+  | "ollama"
+  | "nvinference";
 
 /**
  * 提供商密钥配置映射
@@ -63,6 +64,10 @@ const PROVIDER_KEY_MAPPINGS: Record<ProviderId, ProviderKeyMapping> = {
   ollama: {
     primaryPrefKey: "ollamaApiKey",
     extraKeysPrefKey: "ollamaApiKeysFallback",
+  },
+  nvinference: {
+    primaryPrefKey: "nvInferenceApiKey",
+    extraKeysPrefKey: "nvInferenceApiKeysFallback",
   },
 };
 
