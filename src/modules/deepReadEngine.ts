@@ -34,6 +34,15 @@ export type DeepReadPlanMetadata = {
 };
 
 export const DEEP_READ_SLOT_PREFIX = "zab:slot";
+
+/**
+ * 精读 slot 占位符（“⏳ 等待生成...”/“🔄 正在生成...”）的专用匹配。
+ *
+ * 必须带 emoji 前缀（⏳ / 🔄），否则会误伤正文里正常出现的“生成”相关文字——
+ * 例如关于“数据生成”的论文，章节内容本身就可能包含“正在生成 / 等待生成”等词，
+ * 若用裸词匹配会把已正确生成的笔记误判为损坏，导致反复重生的死循环。
+ */
+const DEEP_READ_PLACEHOLDER_RE = /(?:⏳|🔄)️?\s*(?:等待生成|正在生成)/;
 export const DEEP_READ_PLAN_META_PREFIX = "zab:deep-read-plan";
 
 export function planDeepReadSlots(
@@ -185,12 +194,41 @@ export function getDeepReadSlotStatus(
   return (match?.[1] as DeepReadSlotStatus | undefined) || null;
 }
 
+/** 提取某个 slot 起止标记之间的正文（含 HTML）；找不到返回 null。 */
+export function getDeepReadSlotBody(
+  noteHtml: string,
+  slotId: string,
+): string | null {
+  const match = noteHtml.match(
+    new RegExp(
+      `<!-- ${DEEP_READ_SLOT_PREFIX}:${escapeRegExp(slotId)}:(?:pending|running|done|error) -->([\\s\\S]*?)<!-- ${DEEP_READ_SLOT_PREFIX}:${escapeRegExp(slotId)}:end -->`,
+    ),
+  );
+  return match ? match[1] : null;
+}
+
+/**
+ * 判断 slot 正文是否仍是占位符（“等待生成 / 正在生成”）或空内容。
+ * 用于识别“标记为 done 但内容并未真正生成”的损坏 slot，使其能被重新生成。
+ */
+export function isDeepReadSlotBodyPlaceholder(body: string | null): boolean {
+  if (body == null) return false;
+  return DEEP_READ_PLACEHOLDER_RE.test(body);
+}
+
 export function shouldRunDeepReadSlot(
   noteHtml: string,
   slotId: string,
 ): boolean {
   const status = getDeepReadSlotStatus(noteHtml, slotId);
-  return status === "pending" || status === "running" || status === "error";
+  if (status === "pending" || status === "running" || status === "error") {
+    return true;
+  }
+  // 标记为 done 但正文仍是占位符（损坏的 slot）→ 视为未完成，需要重跑。
+  if (status === "done") {
+    return isDeepReadSlotBodyPlaceholder(getDeepReadSlotBody(noteHtml, slotId));
+  }
+  return false;
 }
 
 export function isDeepReadSlotDone(noteHtml: string, slotId: string): boolean {
@@ -202,7 +240,36 @@ export function hasDeepReadV2Slots(noteHtml: string): boolean {
 }
 
 export function hasRunnableDeepReadSlots(noteHtml: string): boolean {
-  return /<!-- zab:slot:[^:]+:(?:pending|running|error) -->/.test(noteHtml);
+  return extractRunnableDeepReadSlotIds(noteHtml).length > 0;
+}
+
+/**
+ * 笔记中是否残留“等待生成 / 正在生成”占位文本。
+ *
+ * Zotero 的笔记会经过 HTML 清洗，有时会丢弃 `<!-- zab:slot:... -->` 注释标记，
+ * 导致基于标记的续跑逻辑认为笔记已完整，但正文里仍残留占位符、章节从未真正生成。
+ * 这种“标记丢失但有占位符”的损坏笔记需要整体重新生成。
+ */
+export function noteHasDeepReadPlaceholderText(noteHtml: string): boolean {
+  return DEEP_READ_PLACEHOLDER_RE.test(noteHtml);
+}
+
+/**
+ * 返回笔记中所有尚未真正完成的 slot ID：包括 pending/running/error，
+ * 以及“标记为 done 但正文仍是占位符”的损坏 slot。
+ */
+export function extractRunnableDeepReadSlotIds(noteHtml: string): string[] {
+  const ids: string[] = [];
+  const pattern =
+    /<!-- zab:slot:([^:]+):(pending|running|done|error) -->([\s\S]*?)<!-- zab:slot:\1:end -->/g;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(noteHtml))) {
+    const [, slotId, status, body] = match;
+    if (status !== "done" || isDeepReadSlotBodyPlaceholder(body)) {
+      ids.push(slotId);
+    }
+  }
+  return ids;
 }
 
 export function markDeepReadSlotRunning(

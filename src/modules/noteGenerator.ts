@@ -66,9 +66,11 @@ import {
   buildDeepReadSkeletonHtml,
   extractDeepReadChaptersFromHtml,
   extractDeepReadPlanMetadata,
+  extractRunnableDeepReadSlotIds,
   fillDeepReadSlot,
   hasDeepReadV2Slots,
   hasRunnableDeepReadSlots,
+  noteHasDeepReadPlaceholderText,
   isDeepReadSlotDone,
   markDeepReadSlotRunning,
   planDeepReadSlots,
@@ -177,13 +179,26 @@ export class NoteGenerator {
         noteKind,
         promptLanguage,
       );
-      const existing = existingRecord?.note || null;
+      let existing = existingRecord?.note || null;
+      let deepReadExistingHtml = existingRecord?.rawHtml || "";
       const canResumeDeepRead =
         noteKind === "deepRead" &&
         !!existingRecord?.rawHtml &&
         hasDeepReadV2Slots(existingRecord.rawHtml) &&
         hasRunnableDeepReadSlots(existingRecord.rawHtml);
-      if (existing && !options?.forceOverwrite && !canResumeDeepRead) {
+      // 损坏的 AI 精读笔记：标记被 Zotero 清洗丢失但正文仍残留“等待生成/正在生成”
+      // 占位符，章节其实从未生成。无法逐章续跑，需要整体重新生成（不可跳过）。
+      const deepReadHasResidualPlaceholder =
+        noteKind === "deepRead" &&
+        !!existingRecord?.rawHtml &&
+        !canResumeDeepRead &&
+        noteHasDeepReadPlaceholderText(existingRecord.rawHtml);
+      if (
+        existing &&
+        !options?.forceOverwrite &&
+        !canResumeDeepRead &&
+        !deepReadHasResidualPlaceholder
+      ) {
         if (policy === "skip") {
           progressCallback?.(
             `\u5df2\u5b58\u5728${AiNoteService.getTitle(noteKind)}\uff0c\u8df3\u8fc7`,
@@ -194,6 +209,22 @@ export class NoteGenerator {
             content: ((existing as any).getNote?.() as string) || "",
           };
         }
+      }
+
+      // 损坏且无法续跑的 AI 精读笔记：直接删除旧笔记，按全新流程重建一份。
+      // 覆盖已被 Zotero 清洗过的旧笔记往往无法恢复（标记已丢失），而全新创建的
+      // 笔记与正常首次生成行为一致，可避免“占位符残留→反复重排队”的死循环。
+      if (deepReadHasResidualPlaceholder && existing) {
+        try {
+          await (existing as any).eraseTx?.();
+          ztoolkit.log(
+            "[AI-Butler] 删除损坏的 AI 精读笔记，按全新流程重新生成",
+          );
+        } catch (e) {
+          ztoolkit.log("[AI-Butler] 删除损坏 AI 精读笔记失败:", e);
+        }
+        existing = null;
+        deepReadExistingHtml = "";
       }
 
       // Step 1: PDF processing
@@ -371,7 +402,7 @@ export class NoteGenerator {
         const deepReadResult = await this.generateDeepReadContent({
           item,
           existing,
-          existingHtml: existingRecord?.rawHtml || "",
+          existingHtml: deepReadExistingHtml,
           policy,
           pdfContent,
           isBase64,
@@ -1147,6 +1178,24 @@ export class NoteGenerator {
 
     const planned = planDeepReadSlots(template, chapters);
 
+    // 防卡死：若笔记里存在当前计划无法识别的待跑 slot（章节 ID 与计划错位，
+    // 通常是缺少计划元数据、退回正则识别章节导致 ID 漂移），继续“续跑”会永远
+    // 跳过这些 slot，表现为某章一直停在“⏳ 等待生成...”且反复重试也无进展。
+    // 这种情况下放弃续跑，按当前计划重建骨架重新生成，保证一定能推进。
+    const plannedSlotIds = new Set(planned.slots.map((slot) => slot.id));
+    const planDesynced =
+      !!shouldResume &&
+      extractRunnableDeepReadSlotIds(params.existingHtml).some(
+        (slotId) => !plannedSlotIds.has(slotId),
+      );
+    const resumeFromExisting = !!shouldResume && !planDesynced;
+    if (planDesynced) {
+      this.showDeepReadNotice(
+        "检测到精读进度与章节结构不一致，已按当前结构重置并重新生成。",
+        "warning",
+      );
+    }
+
     if (params.outputWindow) {
       params.outputWindow.appendContent(
         `识别到章节：${chapters
@@ -1166,7 +1215,7 @@ export class NoteGenerator {
       template,
       planned,
     );
-    const note = shouldResume
+    const note = resumeFromExisting
       ? (params.existing as Zotero.Item)
       : await AiNoteService.saveGeneratedNote({
           item: params.item,
@@ -1177,6 +1226,9 @@ export class NoteGenerator {
           lang: promptLanguage,
         });
 
+    // 本次调用中真正尝试运行（标记为“正在生成”）的 slot 数；用于区分“章节被跳过
+    // （ID 错位/续跑错位）”与“章节尝试了但失败（接口异常）”，仅前者需要重建骨架。
+    let attemptedSlots = 0;
     let writeQueue = Promise.resolve();
     const updateSlot = async (
       slot: DeepReadSlot,
@@ -1207,6 +1259,7 @@ export class NoteGenerator {
     };
 
     const markSlotRunning = async (slot: DeepReadSlot) => {
+      attemptedSlots += 1;
       params.outputWindow?.updateDeepReadProgressSlot?.(
         slot.id,
         slot.title,
@@ -1423,7 +1476,7 @@ export class NoteGenerator {
       }
     };
 
-    try {
+    const runPasses = async () => {
       for (let pass = 0; pass < MAX_DEEP_READ_PASSES; pass++) {
         await runDeepReadPass();
 
@@ -1440,6 +1493,31 @@ export class NoteGenerator {
           );
           await Zotero.Promise.delay(Math.min(2000 * (pass + 1), 15000));
         }
+      }
+    };
+
+    try {
+      await runPasses();
+
+      // \u515c\u5e95\uff1a\u82e5\u672c\u6b21\u662f\u201c\u7eed\u8dd1\u201d\u4f46\u4e00\u4e2a\u7ae0\u8282\u90fd\u6ca1\u5b8c\u6210\u3001\u5374\u4ecd\u6709\u5f85\u8dd1\u7ae0\u8282\uff0c\u8bf4\u660e\u7b14\u8bb0\u91cc\u7684
+      // slot \u4e0e\u5f53\u524d\u8ba1\u5212\u9519\u4f4d\uff08ID \u6f02\u79fb\u7b49\uff09\uff0c\u7eed\u8dd1\u4f1a\u6c38\u8fdc\u8df3\u8fc7\u5b83\u4eec\u800c\u5361\u6b7b\uff08\u7ae0\u8282\u4e00\u76f4\u505c\u5728
+      // \u201c\u23f3 \u7b49\u5f85\u751f\u6210...\u201d\uff0c\u4e14\u65e0\u6cd5\u6807\u8bb0\u4e3a\u201c\u6b63\u5728\u751f\u6210\u201d\uff09\u3002\u6b64\u65f6\u6309\u5f53\u524d\u8ba1\u5212\u91cd\u5efa\u9aa8\u67b6\u540e\u518d\u8dd1
+      // \u4e00\u8f6e\uff0c\u786e\u4fdd\u4e00\u5b9a\u80fd\u63a8\u8fdb\uff08\u4ee3\u4ef7\u662f\u653e\u5f03\u6b64\u524d\u53ef\u80fd\u6b8b\u7559\u7684\u8fdb\u5ea6\uff09\u3002
+      const stillStuck =
+        resumeFromExisting &&
+        attemptedSlots === 0 &&
+        params.abortSignal?.aborted !== true &&
+        hasRunnableDeepReadSlots(((note as any).getNote?.() as string) || "");
+      if (stillStuck) {
+        this.showDeepReadNotice(
+          "\u7eed\u8dd1\u65e0\u8fdb\u5c55\uff0c\u5df2\u6309\u5f53\u524d\u7ae0\u8282\u7ed3\u6784\u91cd\u7f6e\u5e76\u91cd\u65b0\u751f\u6210\u3002",
+          "warning",
+        );
+        await writeQueue;
+        (note as any).setNote?.(skeleton);
+        await (note as any).saveTx?.();
+        params.outputWindow?.setDeepReadProgressSlots?.(progressSlots);
+        await runPasses();
       }
     } catch (error) {
       if (isAbortError(error, params.abortSignal)) {

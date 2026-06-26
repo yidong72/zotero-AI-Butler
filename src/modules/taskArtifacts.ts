@@ -3,7 +3,10 @@ import { LiteratureReviewService } from "./literatureReviewService";
 import { MindmapService } from "./mindmapService";
 import { NoteGenerator } from "./noteGenerator";
 import { AiNoteService } from "./aiNoteService";
-import { hasRunnableDeepReadSlots } from "./deepReadEngine";
+import {
+  hasRunnableDeepReadSlots,
+  noteHasDeepReadPlaceholderText,
+} from "./deepReadEngine";
 import type { PromptLang } from "../utils/prompts";
 
 export type FixedTaskArtifactType =
@@ -87,6 +90,10 @@ export class TaskArtifacts {
     const noteHtml: string = (note as any).getNote?.() || "";
     if (hasRunnableDeepReadSlots(noteHtml)) {
       return { exists: false, reason: "deep-read-slots-incomplete" };
+    }
+    // 标记被清洗丢失但正文仍残留占位符 → 视为损坏未完成，需要整体重生。
+    if (noteHasDeepReadPlaceholderText(noteHtml)) {
+      return { exists: false, reason: "deep-read-placeholder-residual" };
     }
 
     return { exists: true };
