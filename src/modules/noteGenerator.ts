@@ -1257,14 +1257,73 @@ export class NoteGenerator {
         lastResponse = response;
         await updateSlot(slot, response.text, "done");
       } catch (error: any) {
-        if (isAbortError(error, params.abortSignal)) throw error;
+        // 仅用户主动取消才中断；其余错误记为该章节失败（可再次重试）。
+        if (params.abortSignal?.aborted === true) throw error;
         await updateSlot(slot, error?.message || String(error), "error");
       }
     });
 
     const collected: string[] = [];
+    // \u5355\u6b21\u7cbe\u8bfb\u6700\u591a\u91cd\u8bd5 5 \u8f6e\uff1a\u6bcf\u8f6e\u53ea\u91cd\u8dd1\u5c1a\u672a\u5b8c\u6210\u7684\u7ae0\u8282\uff0c\u7ae0\u8282\u7ea7\u5931\u8d25\uff08\u8d85\u65f6/\u63a5\u53e3\u5f02\u5e38/
+    // \u88ab\u4f9b\u5e94\u5546\u4e2d\u65ad\uff09\u4e0d\u518d\u4e2d\u65ad\u6574\u8f6e\uff0c\u53ea\u6709\u7528\u6237\u4e3b\u52a8\u53d6\u6d88\u624d\u4f1a\u505c\u6b62\uff1b5 \u8f6e\u540e\u4ecd\u672a\u5b8c\u6210\u7684\u7ae0\u8282
+    // \u4fdd\u7559\u4e3a\u53ef\u7eed\u8dd1\u72b6\u6001\uff0c\u4e0b\u6b21\u91cd\u65b0\u8fd0\u884c AI \u7cbe\u8bfb\u4f1a\u4ece\u8fd9\u91cc\u7ee7\u7eed\u3002
+    const MAX_DEEP_READ_PASSES = 5;
 
-    try {
+    const runIndependentSlot = async (
+      slot: DeepReadSlot,
+      index: number,
+      streamLive: boolean,
+    ) => {
+      const currentHtml = ((note as any).getNote?.() as string) || "";
+      if (!shouldRunDeepReadSlot(currentHtml, slot.id)) return;
+
+      throwIfAborted(params.abortSignal);
+      params.progressCallback?.(
+        `\u6b63\u5728\u8ffd\u95ee\uff1a${slot.title}`,
+        78 +
+          Math.floor(
+            (index / Math.max(1, planned.independentSlots.length)) * 12,
+          ),
+      );
+      params.outputWindow?.appendContent(
+        `### \u6b63\u5728\u8ffd\u95ee\uff1a${slot.title}\n\n`,
+      );
+      params.outputWindow?.appendContent(
+        `**\u8ffd\u95ee\u63d0\u793a\u8bcd\uff1a**\n\n${slot.prompt}\n\n`,
+      );
+
+      await markSlotRunning(slot);
+      try {
+        const response = await this.callDeepReadChat({
+          session,
+          item: params.item,
+          pdfContent: params.pdfContent,
+          isBase64: params.isBase64,
+          conversation: [{ role: "user", content: slot.prompt }],
+          abortSignal: params.abortSignal,
+          onProgress: streamLive
+            ? (chunk) => {
+                params.streamCallback?.(chunk);
+                params.outputWindow?.appendContent(chunk);
+              }
+            : undefined,
+        });
+        lastResponse = response;
+        collected.push(`# ${slot.title}\n\n${response.text}`);
+        if (!streamLive) {
+          params.streamCallback?.(response.text);
+          params.outputWindow?.appendContent(response.text);
+        }
+        await updateSlot(slot, response.text, "done");
+      } catch (error: any) {
+        // \u4ec5\u7528\u6237\u4e3b\u52a8\u53d6\u6d88\u624d\u4e2d\u65ad\u6574\u8f6e\uff1b\u5176\u4f59\u9519\u8bef\u8bb0\u4e3a\u8be5\u7ae0\u8282\u5931\u8d25\u5e76\u7ee7\u7eed\uff0c\u7a0d\u540e\u81ea\u52a8\u91cd\u8bd5\u3002
+        if (params.abortSignal?.aborted === true) throw error;
+        await updateSlot(slot, error?.message || String(error), "error");
+      }
+    };
+
+    // \u5355\u8f6e\u7cbe\u8bfb\uff1a\u987a\u5e8f\u9010\u7ae0 + \u72ec\u7acb\u8ffd\u95ee\uff0c\u81ea\u52a8\u8df3\u8fc7\u5df2\u5b8c\u6210\u7684\u7ae0\u8282\u3002
+    const runDeepReadPass = async () => {
       const fullHistory: Array<{
         role: "user" | "assistant";
         content: string;
@@ -1323,70 +1382,11 @@ export class NoteGenerator {
           fullHistory.push({ role: "assistant", content: response.text });
           await updateSlot(slot, response.text, "done");
         } catch (error: any) {
-          if (
-            isAbortError(error, params.abortSignal) ||
-            this.shouldStopDeepReadOnError(error)
-          )
-            throw error;
+          // \u4ec5\u7528\u6237\u4e3b\u52a8\u53d6\u6d88\u624d\u4e2d\u65ad\u6574\u8f6e\uff1b\u5176\u4f59\u9519\u8bef\u8bb0\u4e3a\u8be5\u7ae0\u8282\u5931\u8d25\u5e76\u7ee7\u7eed\uff0c\u7a0d\u540e\u81ea\u52a8\u91cd\u8bd5\u3002
+          if (params.abortSignal?.aborted === true) throw error;
           await updateSlot(slot, error?.message || String(error), "error");
         }
       }
-
-      const runIndependentSlot = async (
-        slot: DeepReadSlot,
-        index: number,
-        streamLive: boolean,
-      ) => {
-        const currentHtml = ((note as any).getNote?.() as string) || "";
-        if (!shouldRunDeepReadSlot(currentHtml, slot.id)) return;
-
-        throwIfAborted(params.abortSignal);
-        params.progressCallback?.(
-          `\u6b63\u5728\u8ffd\u95ee\uff1a${slot.title}`,
-          78 +
-            Math.floor(
-              (index / Math.max(1, planned.independentSlots.length)) * 12,
-            ),
-        );
-        params.outputWindow?.appendContent(
-          `### \u6b63\u5728\u8ffd\u95ee\uff1a${slot.title}\n\n`,
-        );
-        params.outputWindow?.appendContent(
-          `**\u8ffd\u95ee\u63d0\u793a\u8bcd\uff1a**\n\n${slot.prompt}\n\n`,
-        );
-
-        await markSlotRunning(slot);
-        try {
-          const response = await this.callDeepReadChat({
-            session,
-            item: params.item,
-            pdfContent: params.pdfContent,
-            isBase64: params.isBase64,
-            conversation: [{ role: "user", content: slot.prompt }],
-            abortSignal: params.abortSignal,
-            onProgress: streamLive
-              ? (chunk) => {
-                  params.streamCallback?.(chunk);
-                  params.outputWindow?.appendContent(chunk);
-                }
-              : undefined,
-          });
-          lastResponse = response;
-          collected.push(`# ${slot.title}\n\n${response.text}`);
-          if (!streamLive) {
-            params.streamCallback?.(response.text);
-            params.outputWindow?.appendContent(response.text);
-          }
-          await updateSlot(slot, response.text, "done");
-        } catch (error: any) {
-          if (
-            isAbortError(error, params.abortSignal) ||
-            this.shouldStopDeepReadOnError(error)
-          )
-            throw error;
-          await updateSlot(slot, error?.message || String(error), "error");
-        }
-      };
 
       let independentIndex = 0;
       for (const phase of template.phases) {
@@ -1412,12 +1412,33 @@ export class NoteGenerator {
               runIndependentSlot(slot, batchStartIndex + offset, false),
             ),
           );
-          const aborted = results.find(
-            (result) =>
-              result.status === "rejected" &&
-              this.shouldStopDeepReadOnError(result.reason),
+          // \u4ec5\u5728\u7528\u6237\u4e3b\u52a8\u53d6\u6d88\u65f6\u4e2d\u65ad\u6574\u8f6e\uff08\u7ae0\u8282\u7ea7\u5931\u8d25\u5df2\u5728\u5185\u90e8\u6d88\u5316\u5e76\u7ee7\u7eed\uff09\u3002
+          if (params.abortSignal?.aborted === true) {
+            const rejected = results.find(
+              (result) => result.status === "rejected",
+            );
+            if (rejected?.status === "rejected") throw rejected.reason;
+          }
+        }
+      }
+    };
+
+    try {
+      for (let pass = 0; pass < MAX_DEEP_READ_PASSES; pass++) {
+        await runDeepReadPass();
+
+        const passHtml = ((note as any).getNote?.() as string) || "";
+        // \u6240\u6709\u7ae0\u8282\u5747\u5df2\u5b8c\u6210 \u2192 \u7ed3\u675f\u3002
+        if (!hasRunnableDeepReadSlots(passHtml)) break;
+        // \u7528\u6237\u4e3b\u52a8\u53d6\u6d88 \u2192 \u7ed3\u675f\uff08\u5269\u4f59\u7ae0\u8282\u4fdd\u6301\u53ef\u7eed\u8dd1\uff09\u3002
+        if (params.abortSignal?.aborted === true) break;
+        // \u4ecd\u6709\u672a\u5b8c\u6210\u7ae0\u8282\uff1a\u9000\u907f\u540e\u81ea\u52a8\u91cd\u8bd5\u4e0b\u4e00\u8f6e\u3002
+        if (pass < MAX_DEEP_READ_PASSES - 1) {
+          this.showDeepReadNotice(
+            `\u90e8\u5206\u7ae0\u8282\u672a\u5b8c\u6210\uff0c\u6b63\u5728\u81ea\u52a8\u91cd\u8bd5\uff08\u7b2c ${pass + 2}/${MAX_DEEP_READ_PASSES} \u8f6e\uff09...`,
+            "warning",
           );
-          if (aborted?.status === "rejected") throw aborted.reason;
+          await Zotero.Promise.delay(Math.min(2000 * (pass + 1), 15000));
         }
       }
     } catch (error) {
@@ -1598,20 +1619,6 @@ export class NoteGenerator {
     const reason = (response.finishReason || "").toLowerCase();
     return ["length", "max_tokens", "max_output_tokens", "content_filter"].some(
       (value) => reason.includes(value),
-    );
-  }
-
-  private static shouldStopDeepReadOnError(error: unknown): boolean {
-    const value = error as
-      | {
-          name?: string;
-          suppressTaskRetry?: boolean;
-        }
-      | undefined;
-    return (
-      value?.suppressTaskRetry === true ||
-      value?.name === "LLMApiCallError" ||
-      value?.name === "LLMApiExhaustedError"
     );
   }
 
