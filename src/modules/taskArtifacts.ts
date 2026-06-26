@@ -4,6 +4,7 @@ import { MindmapService } from "./mindmapService";
 import { NoteGenerator } from "./noteGenerator";
 import { AiNoteService } from "./aiNoteService";
 import { hasRunnableDeepReadSlots } from "./deepReadEngine";
+import type { PromptLang } from "../utils/prompts";
 
 export type FixedTaskArtifactType =
   | "summary"
@@ -22,17 +23,18 @@ export class TaskArtifacts {
   public static async probe(
     taskType: FixedTaskArtifactType,
     item: Zotero.Item,
+    lang: PromptLang = "zh",
   ): Promise<TaskArtifactProbeResult> {
     try {
       switch (taskType) {
         case "summary":
-          return this.probeSummary(item);
+          return this.probeSummary(item, lang);
         case "deepRead":
-          return this.probeDeepRead(item);
+          return this.probeDeepRead(item, lang);
         case "imageSummary":
-          return this.probeImageSummary(item);
+          return this.probeImageSummary(item, lang);
         case "mindmap":
-          return this.probeMindmap(item);
+          return this.probeMindmap(item, lang);
         case "tableFill":
           return this.probeTable(item);
       }
@@ -57,8 +59,9 @@ export class TaskArtifacts {
 
   private static async probeSummary(
     item: Zotero.Item,
+    lang: PromptLang = "zh",
   ): Promise<TaskArtifactProbeResult> {
-    const note = await NoteGenerator.findExistingNote(item);
+    const note = await NoteGenerator.findExistingNote(item, lang);
     if (!note) {
       return { exists: false, reason: "summary-note-missing" };
     }
@@ -70,8 +73,9 @@ export class TaskArtifacts {
 
   private static async probeDeepRead(
     item: Zotero.Item,
+    lang: PromptLang = "zh",
   ): Promise<TaskArtifactProbeResult> {
-    const note = await AiNoteService.findNote(item, "deepRead");
+    const note = await AiNoteService.findNote(item, "deepRead", lang);
     if (!note) {
       return { exists: false, reason: "deep-read-note-missing" };
     }
@@ -90,8 +94,9 @@ export class TaskArtifacts {
 
   private static async probeImageSummary(
     item: Zotero.Item,
+    lang: PromptLang = "zh",
   ): Promise<TaskArtifactProbeResult> {
-    const note = await ImageNoteGenerator.findExistingImageNote(item);
+    const note = await ImageNoteGenerator.findExistingImageNote(item, lang);
     if (!note) {
       return { exists: false, reason: "image-note-missing" };
     }
@@ -104,8 +109,9 @@ export class TaskArtifacts {
 
   private static async probeMindmap(
     item: Zotero.Item,
+    lang: PromptLang = "zh",
   ): Promise<TaskArtifactProbeResult> {
-    const note = await MindmapService.findExistingMindmapNote(item);
+    const note = await MindmapService.findExistingMindmapNote(item, lang);
     if (!note) {
       return { exists: false, reason: "mindmap-note-missing" };
     }

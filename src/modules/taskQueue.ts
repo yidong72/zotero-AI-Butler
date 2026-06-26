@@ -28,6 +28,7 @@
 import { getPref } from "../utils/prefs";
 import { NoteGenerator } from "./noteGenerator";
 import { PDFExtractor } from "./pdfExtractor";
+import type { PromptLang } from "../utils/prompts";
 import type { LLMAbortSignal } from "./llmproviders/types";
 import {
   LLM_REQUEST_ABORT_MESSAGE,
@@ -149,6 +150,8 @@ export interface TaskItem {
   duration?: number; // 处理耗时(秒)
   /** 任务类型: summary(默认) 或 imageSummary(一图总结) 或 mindmap(思维导图) */
   taskType?: TaskType;
+  /** 提示词语言：英文入口（右键“(English)”）会设为 "en"，默认走中文/自定义提示词 */
+  promptLanguage?: PromptLang;
   /** 工作流阶段 (一图总结专用) */
   workflowStage?: string;
   options?: {
@@ -167,12 +170,20 @@ export interface TaskItem {
   targetedAppendedTableEntries?: string[];
 }
 
-export function getSummaryTaskId(itemId: number): string {
-  return `summary-task-${itemId}`;
+export function getSummaryTaskId(
+  itemId: number,
+  lang: PromptLang = "zh",
+): string {
+  return lang === "en" ? `summary-task-${itemId}-en` : `summary-task-${itemId}`;
 }
 
-export function getDeepReadTaskId(itemId: number): string {
-  return `deepread-task-${itemId}`;
+export function getDeepReadTaskId(
+  itemId: number,
+  lang: PromptLang = "zh",
+): string {
+  return lang === "en"
+    ? `deepread-task-${itemId}-en`
+    : `deepread-task-${itemId}`;
 }
 
 export function getLegacySummaryTaskId(itemId: number): string {
@@ -335,6 +346,7 @@ export class TaskQueueManager {
           item,
           artifactType,
           options,
+          task.promptLanguage,
         )
       ) {
         logTaskQueue(
@@ -389,7 +401,11 @@ export class TaskQueueManager {
     artifactType: FixedTaskArtifactType,
     options?: TaskItem["options"],
   ): Promise<boolean> {
-    const artifact = await TaskArtifacts.probe(artifactType, item);
+    const artifact = await TaskArtifacts.probe(
+      artifactType,
+      item,
+      task.promptLanguage,
+    );
     const policyRequiresRegeneration = this.shouldRegenerateWhenArtifactExists(
       artifactType,
       options,
@@ -440,8 +456,9 @@ export class TaskQueueManager {
     item: Zotero.Item,
     artifactType: FixedTaskArtifactType,
     options?: TaskItem["options"],
+    lang: PromptLang = "zh",
   ): Promise<boolean> {
-    const artifact = await TaskArtifacts.probe(artifactType, item);
+    const artifact = await TaskArtifacts.probe(artifactType, item, lang);
     if (artifact.probeFailed || !artifact.exists) {
       return false;
     }
@@ -503,9 +520,10 @@ export class TaskQueueManager {
     item: Zotero.Item,
     priority: boolean = false,
     options?: { summaryMode?: string; forceOverwrite?: boolean },
+    lang: PromptLang = "zh",
   ): Promise<string> {
     if (options?.summaryMode && options.summaryMode !== "single") {
-      return this.addDeepReadTask(item, priority, options);
+      return this.addDeepReadTask(item, priority, options, lang);
     }
 
     const summaryOptions = {
@@ -513,9 +531,14 @@ export class TaskQueueManager {
       summaryMode: "single",
     };
 
-    const taskId = getSummaryTaskId(item.id);
+    const taskId = getSummaryTaskId(item.id, lang);
     const legacyTaskId = getLegacySummaryTaskId(item.id);
-    if (!this.tasks.has(taskId) && this.tasks.has(legacyTaskId)) {
+    // 旧版任务 ID 迁移仅适用于中文（默认）任务，英文任务使用独立 ID
+    if (
+      lang === "zh" &&
+      !this.tasks.has(taskId) &&
+      this.tasks.has(legacyTaskId)
+    ) {
       const legacyTask = this.tasks.get(legacyTaskId)!;
       this.tasks.delete(legacyTaskId);
       legacyTask.id = taskId;
@@ -526,6 +549,7 @@ export class TaskQueueManager {
     // 检查是否已存在
     if (this.tasks.has(taskId)) {
       const existingTask = this.tasks.get(taskId)!;
+      existingTask.promptLanguage = lang;
       const shouldRun = await this.requeueExistingFixedTask(
         existingTask,
         item,
@@ -553,6 +577,7 @@ export class TaskQueueManager {
         item,
         "summary",
         summaryOptions,
+        lang,
       )
     ) {
       logTaskQueue(`AI 总结已存在且当前策略为跳过，跳过入队: ${taskId}`);
@@ -588,6 +613,7 @@ export class TaskQueueManager {
       retryCount: 0,
       maxRetries: parseInt(getPref("maxRetries") as string) || 3,
       taskType: "summary",
+      promptLanguage: lang,
       workflowStage: "等待 AI 总结",
       options: summaryOptions,
     };
@@ -617,8 +643,9 @@ export class TaskQueueManager {
     item: Zotero.Item,
     priority: boolean = false,
     options?: { summaryMode?: string; forceOverwrite?: boolean },
+    lang: PromptLang = "zh",
   ): Promise<string> {
-    const taskId = getDeepReadTaskId(item.id);
+    const taskId = getDeepReadTaskId(item.id, lang);
     const deepReadOptions = {
       ...(options || {}),
       summaryMode: "deepRead",
@@ -626,6 +653,7 @@ export class TaskQueueManager {
 
     if (this.tasks.has(taskId)) {
       const existingTask = this.tasks.get(taskId)!;
+      existingTask.promptLanguage = lang;
       const shouldRun = await this.requeueExistingFixedTask(
         existingTask,
         item,
@@ -650,6 +678,7 @@ export class TaskQueueManager {
         item,
         "deepRead",
         deepReadOptions,
+        lang,
       )
     ) {
       logTaskQueue(`AI 精读已存在且当前策略为跳过，跳过入队: ${taskId}`);
@@ -684,6 +713,7 @@ export class TaskQueueManager {
       retryCount: 0,
       maxRetries: parseInt(getPref("maxRetries") as string) || 3,
       taskType: "deepRead",
+      promptLanguage: lang,
       workflowStage: "等待 AI 精读",
       options: deepReadOptions,
     };
@@ -714,11 +744,12 @@ export class TaskQueueManager {
   public async addTasks(
     items: Zotero.Item[],
     priority: boolean = false,
+    lang: PromptLang = "zh",
   ): Promise<string[]> {
     const taskIds: string[] = [];
 
     for (const item of items) {
-      const taskId = await this.addTask(item, priority);
+      const taskId = await this.addTask(item, priority, undefined, lang);
       taskIds.push(taskId);
     }
 
@@ -734,12 +765,15 @@ export class TaskQueueManager {
   public async addImageSummaryTask(
     item: Zotero.Item,
     priority: boolean = true,
+    lang: PromptLang = "zh",
   ): Promise<string> {
-    const taskId = `img-task-${item.id}`;
+    const taskId =
+      lang === "en" ? `img-task-${item.id}-en` : `img-task-${item.id}`;
 
     // 检查是否已存在
     if (this.tasks.has(taskId)) {
       const existingTask = this.tasks.get(taskId)!;
+      existingTask.promptLanguage = lang;
       const shouldRun = await this.requeueExistingFixedTask(
         existingTask,
         item,
@@ -772,6 +806,7 @@ export class TaskQueueManager {
       retryCount: 0,
       maxRetries: 1, // 一图总结只重试1次
       taskType: "imageSummary",
+      promptLanguage: lang,
       workflowStage: "等待开始",
     };
 
@@ -851,6 +886,7 @@ export class TaskQueueManager {
           }
         },
         abortController.signal,
+        task.promptLanguage,
       );
 
       // 任务成功完成
@@ -909,12 +945,15 @@ export class TaskQueueManager {
   public async addMindmapTask(
     item: Zotero.Item,
     priority: boolean = true,
+    lang: PromptLang = "zh",
   ): Promise<string> {
-    const taskId = `mindmap-task-${item.id}`;
+    const taskId =
+      lang === "en" ? `mindmap-task-${item.id}-en` : `mindmap-task-${item.id}`;
 
     // 检查是否已存在
     if (this.tasks.has(taskId)) {
       const existingTask = this.tasks.get(taskId)!;
+      existingTask.promptLanguage = lang;
       const shouldRun = await this.requeueExistingFixedTask(
         existingTask,
         item,
@@ -947,6 +986,7 @@ export class TaskQueueManager {
       retryCount: 0,
       maxRetries: 2,
       taskType: "mindmap",
+      promptLanguage: lang,
       workflowStage: "等待开始",
     };
 
@@ -1026,6 +1066,7 @@ export class TaskQueueManager {
           }
         },
         abortController.signal,
+        task.promptLanguage,
       );
 
       // 任务成功完成
@@ -2144,12 +2185,20 @@ export class TaskQueueManager {
             logTaskQueue(`流式内容广播失败: ${e}`);
           }
         },
-        { ...(task.options || {}), abortSignal: abortController.signal },
+        {
+          ...(task.options || {}),
+          promptLanguage: task.promptLanguage,
+          abortSignal: abortController.signal,
+        },
       );
 
       const artifactType: FixedTaskArtifactType =
         task.taskType === "deepRead" ? "deepRead" : "summary";
-      const artifact = await TaskArtifacts.probe(artifactType, item);
+      const artifact = await TaskArtifacts.probe(
+        artifactType,
+        item,
+        task.promptLanguage,
+      );
       if (!artifact.exists) {
         throw new Error(
           artifactType === "deepRead"

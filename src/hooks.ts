@@ -61,6 +61,7 @@ import {
   getDefaultSummaryPrompt,
   PROMPT_VERSION,
   shouldUpdatePrompt,
+  type PromptLang,
 } from "./utils/prompts";
 
 /**
@@ -350,6 +351,14 @@ const CONTEXT_MENU_DOM_IDS: Record<ContextMenuItemId, string> = {
     "zotero-collectionmenu-ai-butler-clear-collection-ai-notes",
 };
 
+// 英文提示词入口（右键“(English)”）的 DOM ID，与对应的中文菜单项配对出现。
+const CONTEXT_MENU_EN_DOM_IDS: Partial<Record<ContextMenuItemId, string>> = {
+  generateSummary: "zotero-itemmenu-ai-butler-summary-en",
+  multiRoundReanalyze: "zotero-itemmenu-ai-butler-multi-round-en",
+  imageSummary: "zotero-itemmenu-ai-butler-image-summary-en",
+  mindmap: "zotero-itemmenu-ai-butler-mindmap-en",
+};
+
 type ContextMenuScope = "item" | "collection";
 type ContextMenuDefinition = {
   scope: ContextMenuScope;
@@ -370,6 +379,9 @@ function unregisterContextMenuItems(menu: {
   }
   for (const item of CONTEXT_MENU_ITEMS) {
     menu.unregister(CONTEXT_MENU_DOM_IDS[item.id]);
+  }
+  for (const enId of Object.values(CONTEXT_MENU_EN_DOM_IDS)) {
+    if (enId) menu.unregister(enId);
   }
 }
 
@@ -1085,11 +1097,78 @@ function registerContextMenuItem() {
     },
   };
 
-  const orderedDefinitions = getContextMenuItemOrder()
-    .map((itemId) => menuDefinitions[itemId])
-    .filter((definition): definition is ContextMenuDefinition =>
-      Boolean(definition),
-    );
+  // 英文提示词入口：复用对应中文菜单项的可见性逻辑，但调用处理函数时传入 "en"，
+  // 使该次操作使用内置英文提示词（忽略中文自定义/默认提示词）。
+  const enMenuDefinitions: Partial<
+    Record<ContextMenuItemId, ContextMenuDefinition>
+  > = {
+    generateSummary: {
+      scope: "item",
+      options: {
+        tag: "menuitem",
+        id: CONTEXT_MENU_EN_DOM_IDS.generateSummary,
+        label: `${getString("menuitem-generateSummary")} (English)`,
+        icon: menuIcon,
+        commandListener: (_ev: Event) => {
+          handleGenerateSummary("en");
+        },
+        getVisibility: () =>
+          isContextMenuItemEnabled("generateSummary") &&
+          isRegularItemSelection(),
+      },
+    },
+    multiRoundReanalyze: {
+      scope: "item",
+      options: {
+        tag: "menuitem",
+        id: CONTEXT_MENU_EN_DOM_IDS.multiRoundReanalyze,
+        label: `${getString("menuitem-multiRoundReanalyze" as any)} (English)`,
+        icon: menuIcon,
+        commandListener: () => handleMultiRoundSummary("en"),
+        getVisibility: () =>
+          isContextMenuItemEnabled("multiRoundReanalyze") &&
+          isRegularItemSelection(),
+      },
+    },
+    imageSummary: {
+      scope: "item",
+      options: {
+        tag: "menuitem",
+        id: CONTEXT_MENU_EN_DOM_IDS.imageSummary,
+        label: `${getString("menuitem-imageSummary")} (English)`,
+        icon: menuIcon,
+        commandListener: async () => {
+          await handleImageSummary("en");
+        },
+        getVisibility: () =>
+          isContextMenuItemEnabled("imageSummary") && isRegularItemSelection(),
+      },
+    },
+    mindmap: {
+      scope: "item",
+      options: {
+        tag: "menuitem",
+        id: CONTEXT_MENU_EN_DOM_IDS.mindmap,
+        label: `${getString("menuitem-mindmap" as any)} (English)`,
+        icon: menuIcon,
+        commandListener: async () => {
+          await handleMindmapGeneration("en");
+        },
+        getVisibility: () =>
+          isContextMenuItemEnabled("mindmap") && isRegularItemSelection(),
+      },
+    },
+  };
+
+  // 按用户配置的顺序排列中文菜单项，并在每个有英文入口的项后面紧跟其 (English) 版本。
+  const orderedDefinitions: ContextMenuDefinition[] = [];
+  for (const itemId of getContextMenuItemOrder()) {
+    const definition = menuDefinitions[itemId];
+    if (!definition) continue;
+    orderedDefinitions.push(definition);
+    const enDefinition = enMenuDefinitions[itemId];
+    if (enDefinition) orderedDefinitions.push(enDefinition);
+  }
 
   if (isContextMenuCollapsed()) {
     for (const scope of ["item", "collection"] as const) {
@@ -1435,7 +1514,7 @@ async function handleOpenAIChat(itemId: number): Promise<void> {
  * - 区分成功和失败的条目
  * - 汇总显示批量处理统计
  */
-async function handleGenerateSummary() {
+async function handleGenerateSummary(lang: PromptLang = "zh") {
   // 第一步:验证 API 配置
   // 新版本以用户配置的 endpoint 列表作为主路由来源。
   let enabledEndpoints = LLMEndpointManager.getEnabledEndpoints();
@@ -1501,7 +1580,7 @@ async function handleGenerateSummary() {
   try {
     const manager = TaskQueueManager.getInstance();
     const priority = items.length === 1;
-    await manager.addTasks(items, priority);
+    await manager.addTasks(items, priority, lang);
     await maybeOpenTaskPanelAfterQueue();
 
     progressWin
@@ -1664,7 +1743,7 @@ function onShortcuts(type: string) {
  *
  * 为选中的文献条目生成学术概念海报图片并保存到笔记中
  */
-async function handleImageSummary() {
+async function handleImageSummary(lang: PromptLang = "zh") {
   // 1. 获取选中条目
   const items = Zotero.getActiveZoteroPane().getSelectedItems();
   if (!items || items.length === 0) {
@@ -1693,7 +1772,7 @@ async function handleImageSummary() {
     // 添加到任务队列
     const { TaskQueueManager } = await import("./modules/taskQueue");
     const manager = TaskQueueManager.getInstance();
-    await manager.addImageSummaryTask(item);
+    await manager.addImageSummaryTask(item, true, lang);
 
     // 显示开始提示
     new ztoolkit.ProgressWindow("AI Butler", {
@@ -1721,7 +1800,7 @@ async function handleImageSummary() {
  *
  * 为选中的文献条目生成思维导图并保存到笔记中
  */
-async function handleMindmapGeneration() {
+async function handleMindmapGeneration(lang: PromptLang = "zh") {
   // 1. 获取选中条目
   const items = Zotero.getActiveZoteroPane().getSelectedItems();
   if (!items || items.length === 0) {
@@ -1750,7 +1829,7 @@ async function handleMindmapGeneration() {
     // 添加到任务队列
     const { TaskQueueManager } = await import("./modules/taskQueue");
     const manager = TaskQueueManager.getInstance();
-    await manager.addMindmapTask(item);
+    await manager.addMindmapTask(item, true, lang);
 
     // 显示开始提示
     new ztoolkit.ProgressWindow("AI Butler", {
@@ -1962,7 +2041,7 @@ async function handleFillTable() {
 /**
  * 处理 AI 精读任务
  */
-async function handleMultiRoundSummary() {
+async function handleMultiRoundSummary(lang: PromptLang = "zh") {
   // 1. 验证 API 配置 (简略版，主要依赖后续流程的检查)
   const provider =
     (Zotero.Prefs.get(`${config.prefsPrefix}.provider`, true) as string) ||
@@ -1989,9 +2068,14 @@ async function handleMultiRoundSummary() {
     // 批量添加任务，遵守“已有 AI 总结 / AI 精读时的策略”。
     // 若设置为 skip 且已有完整 AI 精读，任务队列会跳过；若精读半成品，仍会补跑未完成轮次。
     for (const item of items) {
-      await taskQueue.addDeepReadTask(item, priority, {
-        summaryMode: "deepRead",
-      });
+      await taskQueue.addDeepReadTask(
+        item,
+        priority,
+        {
+          summaryMode: "deepRead",
+        },
+        lang,
+      );
     }
 
     new ztoolkit.ProgressWindow("AI Butler", {

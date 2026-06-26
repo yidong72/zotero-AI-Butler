@@ -50,13 +50,16 @@ import {
   DEFAULT_TABLE_FILL_PROMPT,
   DEFAULT_TABLE_TEMPLATE,
   DEFAULT_MULTI_ROUND_PLANNING_PROMPT,
+  DEFAULT_MULTI_ROUND_PLANNING_PROMPT_EN,
   getBuiltinMultiRoundPromptTemplates,
   getDefaultMultiRoundPromptTemplate,
+  getDefaultSummaryPrompt,
   mergeMultiRoundPromptTemplates,
   parseChapterStructureResult,
   parseManualChapterStructure,
   parseMultiRoundPromptTemplates,
   type MultiRoundPromptTemplate,
+  type PromptLang,
   type SummaryMode,
 } from "../utils/prompts";
 import {
@@ -135,6 +138,7 @@ export class NoteGenerator {
     options?: {
       summaryMode?: string;
       forceOverwrite?: boolean;
+      promptLanguage?: PromptLang;
       abortSignal?: LLMAbortSignal;
     },
   ): Promise<{ note: Zotero.Item; content: string }> {
@@ -167,7 +171,12 @@ export class NoteGenerator {
         summaryMode === "single" && !useMultiModelSummary
           ? "summary"
           : "deepRead";
-      const existingRecord = await AiNoteService.findNoteRecord(item, noteKind);
+      const promptLanguage: PromptLang = options?.promptLanguage || "zh";
+      const existingRecord = await AiNoteService.findNoteRecord(
+        item,
+        noteKind,
+        promptLanguage,
+      );
       const existing = existingRecord?.note || null;
       const canResumeDeepRead =
         noteKind === "deepRead" &&
@@ -325,10 +334,16 @@ export class NoteGenerator {
           }
         };
 
+        // 英文入口：显式传入英文默认提示词，绕过中文自定义/默认提示词
+        const summaryPromptOverride =
+          options?.promptLanguage === "en"
+            ? getDefaultSummaryPrompt("en")
+            : undefined;
         let response: LLMResponse;
         if (useMultiPdfMode) {
           response = await LLMService.generate({
             task: "summary",
+            prompt: summaryPromptOverride,
             content: {
               kind: "zotero-item",
               item,
@@ -340,6 +355,7 @@ export class NoteGenerator {
         } else {
           response = await LLMService.generate({
             task: "summary",
+            prompt: summaryPromptOverride,
             content: {
               kind: "zotero-item",
               item,
@@ -364,6 +380,7 @@ export class NoteGenerator {
           progressCallback,
           streamCallback,
           abortSignal: options?.abortSignal,
+          promptLanguage: options?.promptLanguage,
         });
         note = deepReadResult.note;
         fullContent = deepReadResult.content;
@@ -397,7 +414,7 @@ export class NoteGenerator {
         this.formatNoteContent(
           itemTitle,
           fullContent,
-          AiNoteService.getTitle(noteKind),
+          AiNoteService.getTitle(noteKind, promptLanguage),
         );
       if (!noteContentOverride && llmMetadata) {
         noteContent = LLMNoteMetadataService.wrapHtml(noteContent, llmMetadata);
@@ -409,6 +426,7 @@ export class NoteGenerator {
         html: noteContent,
         existing,
         policy,
+        lang: promptLanguage,
       });
 
       // 如果有输出窗口,标记当前条目完成
@@ -488,9 +506,10 @@ export class NoteGenerator {
   /** 查找已有的 AI 总结笔记(通过标签或标题标识，排除后续追问等独立笔记) */
   public static async findExistingNote(
     item: Zotero.Item,
+    lang: PromptLang = "zh",
   ): Promise<Zotero.Item | null> {
     try {
-      return await AiNoteService.findNote(item, "summary");
+      return await AiNoteService.findNote(item, "summary", lang);
     } catch {
       return null;
     }
@@ -1017,13 +1036,15 @@ export class NoteGenerator {
     progressCallback?: (message: string, progress: number) => void;
     streamCallback?: (chunk: string) => void;
     abortSignal?: LLMAbortSignal;
+    promptLanguage?: PromptLang;
   }): Promise<{
     note: Zotero.Item;
     content: string;
     noteHtml: string;
     response?: LLMResponse;
   }> {
-    const currentTemplate = this.getActiveDeepReadTemplate();
+    const promptLanguage: PromptLang = params.promptLanguage || "zh";
+    const currentTemplate = this.getActiveDeepReadTemplate(promptLanguage);
     const shouldResume =
       params.existing &&
       hasDeepReadV2Slots(params.existingHtml) &&
@@ -1085,7 +1106,10 @@ export class NoteGenerator {
     }
 
     if (!chapters.length) {
-      const planningPrompt = DEFAULT_MULTI_ROUND_PLANNING_PROMPT;
+      const planningPrompt =
+        promptLanguage === "en"
+          ? DEFAULT_MULTI_ROUND_PLANNING_PROMPT_EN
+          : DEFAULT_MULTI_ROUND_PLANNING_PROMPT;
       params.outputWindow?.appendContent("### 正在解析章节结构\n\n");
       params.outputWindow?.appendContent(
         `**章节解析提示词：**\n\n${planningPrompt}\n\n`,
@@ -1150,6 +1174,7 @@ export class NoteGenerator {
           html: skeleton,
           existing: params.existing,
           policy: params.policy === "append" ? "append" : "overwrite",
+          lang: promptLanguage,
         });
 
     let writeQueue = Promise.resolve();
@@ -1460,7 +1485,13 @@ export class NoteGenerator {
     }
   }
 
-  private static getActiveDeepReadTemplate(): MultiRoundPromptTemplate {
+  private static getActiveDeepReadTemplate(
+    lang: PromptLang = "zh",
+  ): MultiRoundPromptTemplate {
+    // 英文入口：直接使用内置英文模板，忽略用户选择的中文模板
+    if (lang === "en") {
+      return getDefaultMultiRoundPromptTemplate("en");
+    }
     const selectedTemplateId = (
       (getPref("multiRoundPromptTemplateId" as any) as string) || ""
     ).trim();

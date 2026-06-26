@@ -3,6 +3,8 @@ export type NoteTag = { tag: string };
 export const LEGACY_SUMMARY_NOTE_TAG = "AI-Generated";
 export const SUMMARY_NOTE_TAG = "AI-Summary";
 export const DEEP_READ_NOTE_TAG = "AI-DeepRead";
+/** 英文提示词入口生成的笔记会附带该标记标签，使中英文版本互不覆盖。 */
+export const ENGLISH_NOTE_TAG = "AI-English";
 const TABLE_NOTE_TAG = "AI-Table";
 const CHAT_NOTE_TAG = "AI-Butler-Chat";
 const MINDMAP_NOTE_TAG = "AI-Mindmap";
@@ -29,6 +31,11 @@ export type AiButlerNoteType =
 
 export function hasNoteTag(tags: NoteTag[], tag: string): boolean {
   return tags.some((t) => t.tag === tag);
+}
+
+/** 判断笔记是否为英文提示词入口生成（带 ENGLISH_NOTE_TAG 标签）。 */
+export function isEnglishNote(tags: NoteTag[]): boolean {
+  return hasNoteTag(tags, ENGLISH_NOTE_TAG);
 }
 
 export function isFollowUpChatNote(tags: NoteTag[], noteHtml: string): boolean {

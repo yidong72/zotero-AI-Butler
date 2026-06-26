@@ -1,12 +1,15 @@
 ﻿import {
   DEEP_READ_NOTE_TAG,
+  ENGLISH_NOTE_TAG,
   LEGACY_SUMMARY_NOTE_TAG,
   SUMMARY_NOTE_TAG,
   isDeepReadNote,
+  isEnglishNote,
   isFollowUpChatNote,
   isRegularSummaryNote,
   type NoteTag,
 } from "./aiNoteClassifier";
+import type { PromptLang } from "../utils/prompts";
 import {
   buildFollowUpChatPairNoteHtml,
   normalizeFollowUpChatNoteHtml,
@@ -33,9 +36,14 @@ const NOTE_KIND_TITLE: Record<AiNoteKind, string> = {
   deepRead: "AI 精读",
 };
 
+const NOTE_KIND_TITLE_EN: Record<AiNoteKind, string> = {
+  summary: "AI Summary",
+  deepRead: "AI Deep Read",
+};
+
 export class AiNoteService {
-  public static getTitle(kind: AiNoteKind): string {
-    return NOTE_KIND_TITLE[kind];
+  public static getTitle(kind: AiNoteKind, lang: PromptLang = "zh"): string {
+    return lang === "en" ? NOTE_KIND_TITLE_EN[kind] : NOTE_KIND_TITLE[kind];
   }
 
   public static getTag(kind: AiNoteKind): string {
@@ -57,14 +65,16 @@ export class AiNoteService {
   public static async findNote(
     item: Zotero.Item,
     kind: AiNoteKind,
+    lang: PromptLang = "zh",
   ): Promise<Zotero.Item | null> {
-    const record = await this.findNoteRecord(item, kind);
+    const record = await this.findNoteRecord(item, kind, lang);
     return record?.note || null;
   }
 
   public static async findNoteRecord(
     item: Zotero.Item,
     kind: AiNoteKind,
+    lang: PromptLang = "zh",
   ): Promise<AiNoteRecord | null> {
     try {
       const parentItem = await this.resolveParentItem(item);
@@ -83,6 +93,8 @@ export class AiNoteService {
             ? isRegularSummaryNote(tags, noteHtml)
             : isDeepReadNote(tags, noteHtml);
         if (!matches) continue;
+        // 中英文版本按 ENGLISH_NOTE_TAG 区分，避免互相覆盖。
+        if (isEnglishNote(tags) !== (lang === "en")) continue;
 
         if (!target || compareModified(note, target) > 0) {
           target = note as Zotero.Item;
@@ -103,8 +115,9 @@ export class AiNoteService {
   public static async hasNote(
     item: Zotero.Item,
     kind: AiNoteKind,
+    lang: PromptLang = "zh",
   ): Promise<boolean> {
-    return !!(await this.findNote(item, kind));
+    return !!(await this.findNote(item, kind, lang));
   }
 
   public static async saveGeneratedNote(options: {
@@ -113,11 +126,13 @@ export class AiNoteService {
     html: string;
     existing?: Zotero.Item | null;
     policy?: string;
+    lang?: PromptLang;
   }): Promise<Zotero.Item> {
     const parentItem =
       (await this.resolveParentItem(options.item)) || options.item;
     const tag = NOTE_KIND_TAG[options.kind];
     const existing = options.existing || null;
+    const isEnglish = options.lang === "en";
 
     if (existing) {
       const oldHtml = (existing as any).getNote?.() || "";
@@ -129,6 +144,7 @@ export class AiNoteService {
       this.ensureTag(existing, tag);
       if (options.kind === "summary")
         this.ensureTag(existing, SUMMARY_NOTE_TAG);
+      if (isEnglish) this.ensureTag(existing, ENGLISH_NOTE_TAG);
       await (existing as any).saveTx?.();
       return existing;
     }
@@ -138,6 +154,7 @@ export class AiNoteService {
     note.parentID = parentItem.id;
     note.setNote(options.html);
     note.addTag(tag);
+    if (isEnglish) note.addTag(ENGLISH_NOTE_TAG);
     await note.saveTx();
     return note;
   }

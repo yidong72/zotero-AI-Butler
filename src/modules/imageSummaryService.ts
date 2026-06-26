@@ -24,6 +24,7 @@ import type { LLMAbortSignal } from "./llmproviders/types";
 import {
   getDefaultImageSummaryPrompt,
   getDefaultImageGenerationPrompt,
+  type PromptLang,
 } from "../utils/prompts";
 
 /**
@@ -61,6 +62,7 @@ export class ImageSummaryService {
     item: Zotero.Item,
     progressCallback?: WorkflowProgressCallback,
     abortSignal?: LLMAbortSignal,
+    lang: PromptLang = "zh",
   ): Promise<Zotero.Item> {
     const itemTitle = item.getField("title") as string;
 
@@ -124,6 +126,7 @@ export class ImageSummaryService {
         isBase64,
         itemTitle,
         abortSignal,
+        lang,
       );
 
       ztoolkit.log(
@@ -133,7 +136,7 @@ export class ImageSummaryService {
       // ========== 阶段 3: 生成学术概念海报 ==========
       progressCallback?.("generating", "正在生成学术概念海报...", 60);
 
-      const imagePrompt = this.buildImagePrompt(visualSummary, itemTitle);
+      const imagePrompt = this.buildImagePrompt(visualSummary, itemTitle, lang);
 
       const imageResult = await ImageClient.generateImage(imagePrompt, {
         abortSignal,
@@ -150,6 +153,7 @@ export class ImageSummaryService {
         item,
         imageResult.imageBase64,
         imageResult.mimeType,
+        lang,
       );
 
       progressCallback?.("completed", "一图总结生成完成！", 100);
@@ -196,11 +200,14 @@ export class ImageSummaryService {
     isBase64: boolean,
     itemTitle: string,
     abortSignal?: LLMAbortSignal,
+    lang: PromptLang = "zh",
   ): Promise<string> {
-    // 获取视觉提取提示词
+    // 获取视觉提取提示词；英文入口忽略中文自定义提示词，直接用内置英文模板
     let prompt =
-      (getPref("imageSummaryPrompt" as any) as string) ||
-      getDefaultImageSummaryPrompt();
+      lang === "en"
+        ? getDefaultImageSummaryPrompt("en")
+        : (getPref("imageSummaryPrompt" as any) as string) ||
+          getDefaultImageSummaryPrompt();
 
     // 替换变量
     prompt = prompt.replace(
@@ -208,6 +215,10 @@ export class ImageSummaryService {
       isBase64 ? "[PDF 文件内容]" : pdfContent.substring(0, 5000),
     );
     prompt = prompt.replace(/\$\{title\}/g, itemTitle);
+    prompt = prompt.replace(
+      /\$\{language\}/g,
+      lang === "en" ? "English" : "中文",
+    );
 
     // 调用 LLM 生成视觉摘要 (使用带重试的方法，支持 API 密钥轮换)
     const summary = await LLMService.generateText({
@@ -231,15 +242,20 @@ export class ImageSummaryService {
   private static buildImagePrompt(
     visualSummary: string,
     itemTitle: string,
+    lang: PromptLang = "zh",
   ): string {
-    // 获取生图提示词模板
+    // 获取生图提示词模板；英文入口忽略中文自定义提示词
     let prompt =
-      (getPref("imageSummaryImagePrompt" as any) as string) ||
-      getDefaultImageGenerationPrompt();
+      lang === "en"
+        ? getDefaultImageGenerationPrompt("en")
+        : (getPref("imageSummaryImagePrompt" as any) as string) ||
+          getDefaultImageGenerationPrompt();
 
-    // 获取语言设置
+    // 获取语言设置；英文入口强制英文输出
     const language =
-      (getPref("imageSummaryLanguage" as any) as string) || "中文";
+      lang === "en"
+        ? "English"
+        : (getPref("imageSummaryLanguage" as any) as string) || "中文";
 
     // 替换变量
     prompt = prompt.replace(/\$\{summaryForImage\}/g, visualSummary);

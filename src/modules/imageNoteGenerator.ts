@@ -14,6 +14,9 @@
  * @author AI-Butler Team
  */
 
+import { ENGLISH_NOTE_TAG, isEnglishNote } from "./aiNoteClassifier";
+import type { PromptLang } from "../utils/prompts";
+
 /**
  * 一图总结笔记生成器类
  *
@@ -41,11 +44,12 @@ export class ImageNoteGenerator {
     item: Zotero.Item,
     imageBase64: string,
     mimeType: string = "image/png",
+    lang: PromptLang = "zh",
   ): Promise<Zotero.Item> {
     const itemTitle = item.getField("title") as string;
 
-    // 检查是否已存在一图总结笔记
-    let note = await this.findExistingImageNote(item);
+    // 检查是否已存在同语言的一图总结笔记（中英文版本互不覆盖）
+    let note = await this.findExistingImageNote(item, lang);
     const isUpdate = !!note;
 
     if (!note) {
@@ -55,6 +59,7 @@ export class ImageNoteGenerator {
       note.parentID = item.id;
       note.setNote("<p>正在生成一图总结...</p>");
       note.addTag(this.IMAGE_NOTE_TAG);
+      if (lang === "en") note.addTag(ENGLISH_NOTE_TAG);
       await note.saveTx();
       ztoolkit.log(`[AI-Butler] 创建新的一图总结笔记: ${note.id}`);
     }
@@ -304,6 +309,7 @@ export class ImageNoteGenerator {
    */
   public static async findExistingImageNote(
     item: Zotero.Item,
+    lang: PromptLang = "zh",
   ): Promise<Zotero.Item | null> {
     try {
       const noteIDs = (item as any).getNotes?.() || [];
@@ -316,6 +322,8 @@ export class ImageNoteGenerator {
         // 检查是否有一图总结标签
         const tags: Array<{ tag: string }> = (n as any).getTags?.() || [];
         const hasTag = tags.some((t) => t.tag === this.IMAGE_NOTE_TAG);
+        // 中英文版本按 ENGLISH_NOTE_TAG 区分，互不覆盖
+        if (isEnglishNote(tags) !== (lang === "en")) continue;
 
         // 检查标题是否匹配 (多种模式)
         const noteHtml: string = (n as any).getNote?.() || "";

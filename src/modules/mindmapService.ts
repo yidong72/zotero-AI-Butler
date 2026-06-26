@@ -20,7 +20,8 @@ import {
 } from "./llmNoteMetadata";
 import type { LLMAbortSignal, LLMResponse } from "./llmproviders/types";
 import { getPref } from "../utils/prefs";
-import { getDefaultMindmapPrompt } from "../utils/prompts";
+import { getDefaultMindmapPrompt, type PromptLang } from "../utils/prompts";
+import { ENGLISH_NOTE_TAG, isEnglishNote } from "./aiNoteClassifier";
 
 /**
  * 工作流阶段类型
@@ -56,6 +57,7 @@ export class MindmapService {
     item: Zotero.Item,
     progressCallback?: MindmapProgressCallback,
     abortSignal?: LLMAbortSignal,
+    lang: PromptLang = "zh",
   ): Promise<Zotero.Item> {
     const itemTitle = item.getField("title") as string;
 
@@ -85,6 +87,7 @@ export class MindmapService {
         item,
         itemTitle,
         abortSignal,
+        lang,
       );
       const mindmapMarkdown = mindmapResult.markdown;
 
@@ -99,6 +102,7 @@ export class MindmapService {
         item,
         mindmapMarkdown,
         LLMNoteMetadataService.fromResponse("mindmap", mindmapResult.response),
+        lang,
       );
 
       progressCallback?.("completed", "思维导图生成完成！", 100);
@@ -120,10 +124,14 @@ export class MindmapService {
     item: Zotero.Item,
     itemTitle: string,
     abortSignal?: LLMAbortSignal,
+    lang: PromptLang = "zh",
   ): Promise<{ markdown: string; response: LLMResponse }> {
-    // 获取思维导图提示词
+    // 获取思维导图提示词；英文入口忽略中文自定义提示词，直接用内置英文模板
     const prompt =
-      (getPref("mindmapPrompt" as any) as string) || getDefaultMindmapPrompt();
+      lang === "en"
+        ? getDefaultMindmapPrompt("en")
+        : (getPref("mindmapPrompt" as any) as string) ||
+          getDefaultMindmapPrompt();
 
     // 调用 LLM 生成思维导图 Markdown
     const response = await LLMService.generate({
@@ -228,9 +236,10 @@ ${truncatedRequest}`;
     item: Zotero.Item,
     mindmapMarkdown: string,
     metadata?: LLMNoteMetadata | null,
+    lang: PromptLang = "zh",
   ): Promise<Zotero.Item> {
-    // 查找并删除已有的思维导图笔记
-    const existingNote = await this.findExistingMindmapNote(item);
+    // 查找并删除已有的同语言思维导图笔记（中英文版本互不覆盖）
+    const existingNote = await this.findExistingMindmapNote(item, lang);
     if (existingNote) {
       await existingNote.eraseTx();
     }
@@ -242,7 +251,10 @@ ${truncatedRequest}`;
       itemTitle.length > maxTitleLength
         ? itemTitle.substring(0, maxTitleLength) + "..."
         : itemTitle;
-    const noteTitle = `AI 管家思维导图 - ${truncatedTitle}`;
+    const noteTitle =
+      lang === "en"
+        ? `AI Mindmap - ${truncatedTitle}`
+        : `AI 管家思维导图 - ${truncatedTitle}`;
 
     // 将 Markdown 包裹在 markmap 代码块中
     // 注意：不要对 markmap 代码块进行 HTML 转义，否则侧边栏正则无法匹配
@@ -266,6 +278,7 @@ ${truncatedRequest}`;
 
     // 添加标签 - 只使用 AI-Mindmap 标签，不添加 AI-Generated 避免与普通笔记混淆
     note.addTag("AI-Mindmap", 0);
+    if (lang === "en") note.addTag(ENGLISH_NOTE_TAG);
 
     await note.saveTx();
 
@@ -279,6 +292,7 @@ ${truncatedRequest}`;
    */
   public static async findExistingMindmapNote(
     item: Zotero.Item,
+    lang: PromptLang = "zh",
   ): Promise<Zotero.Item | null> {
     const noteIds = item.getNotes();
     for (const noteId of noteIds) {
@@ -287,16 +301,17 @@ ${truncatedRequest}`;
 
       const tags: Array<{ tag: string }> = (note as any).getTags?.() || [];
       const hasTag = tags.some((t) => t.tag === "AI-Mindmap");
-
-      if (hasTag) {
-        return note;
-      }
-
-      // 也检查笔记标题
       const noteHtml: string = (note as any).getNote?.() || "";
-      if (/<h2>\s*AI\s*管家思维导图\s*-/.test(noteHtml)) {
-        return note;
-      }
+      const isMindmap =
+        hasTag ||
+        /<h2>\s*AI\s*管家思维导图\s*-/.test(noteHtml) ||
+        /<h2>\s*AI\s*Mindmap\s*-/.test(noteHtml);
+      if (!isMindmap) continue;
+
+      // 中英文版本按 ENGLISH_NOTE_TAG 区分，互不覆盖
+      if (isEnglishNote(tags) !== (lang === "en")) continue;
+
+      return note;
     }
 
     return null;
