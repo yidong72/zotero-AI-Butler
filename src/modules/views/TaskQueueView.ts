@@ -653,7 +653,7 @@ export class TaskQueueView extends BaseView {
         创建时间: ${task.createdAt.toLocaleString("zh-CN")}
         ${task.completedAt ? `<br/>完成时间: ${task.completedAt.toLocaleString("zh-CN")}` : ""}
         ${safeError ? `<br/><span style="color: #f44336;">错误: ${safeError}</span>` : ""}
-        ${task.retryCount > 0 ? `<br/>重试次数: ${task.retryCount}` : ""}
+        ${task.retryCount > 0 ? `<br/>${isDeepRead ? `连续无进展尝试: ${task.retryCount}/${task.maxRetries}` : `重试次数: ${task.retryCount}`}` : ""}
         ${isImageSummary && task.workflowStage ? `<br/><strong style="color: #9c27b0;">阶段: ${task.workflowStage}</strong>` : ""}
         ${isMindmap && task.workflowStage ? `<br/><strong style="color: #4caf50;">阶段: ${task.workflowStage}</strong>` : ""}
         ${task.taskType === "tableFill" && task.workflowStage ? `<br/><strong style="color: #ff9800;">阶段: ${task.workflowStage}</strong>` : ""}

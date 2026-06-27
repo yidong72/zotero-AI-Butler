@@ -82,6 +82,7 @@ pref("__prefsPrefix__.legacyAiNoteRenamePromptState", "");
 
 // ==================== 任务队列配置 ====================
 pref("__prefsPrefix__.maxRetries", "3");
+pref("__prefsPrefix__.deepReadMaxRetries", "5");
 pref("__prefsPrefix__.batchSize", "1");
 pref("__prefsPrefix__.batchInterval", "60");
 pref("__prefsPrefix__.autoScan", false);

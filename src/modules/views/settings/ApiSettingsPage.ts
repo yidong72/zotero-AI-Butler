@@ -771,6 +771,22 @@ export class ApiSettingsPage {
     });
     form.appendChild(scheduleTitle);
 
+    const deepReadRetryInput = this.createInput(
+      "deepReadMaxRetries",
+      "number",
+      getPref("deepReadMaxRetries") as string,
+      "5",
+    );
+    deepReadRetryInput.min = "1";
+    deepReadRetryInput.max = "5";
+    form.appendChild(
+      this.createFormGroup(
+        "AI 精读连续无进展上限",
+        deepReadRetryInput,
+        "默认 5 次，范围 1-5。只要有新章节完成，计数就会重置；提高此值会增加接口请求和等待时间。",
+      ),
+    );
+
     // 每批次处理论文数量
     form.appendChild(
       this.createFormGroup(
@@ -2447,6 +2463,11 @@ export class ApiSettingsPage {
         checkboxValue("enablePromptCacheOptimization", false),
       );
       setPref("requestTimeout", inputValue("requestTimeout", "300000"));
+      const deepReadRetries = Math.min(
+        5,
+        Math.max(1, parseInt(inputValue("deepReadMaxRetries", "5"), 10) || 5),
+      );
+      setPref("deepReadMaxRetries", String(deepReadRetries));
       setPref("batchSize", inputValue("batchSize", "1"));
       setPref("batchInterval", inputValue("batchInterval", "60"));
       setPref("scanInterval", inputValue("scanInterval", "300"));
@@ -2598,6 +2619,9 @@ export class ApiSettingsPage {
         "#setting-enablePromptCacheOptimization",
       ) as HTMLInputElement;
       // 调度配置
+      const deepReadMaxRetriesEl = this.container.querySelector(
+        "#setting-deepReadMaxRetries",
+      ) as HTMLInputElement;
       const batchSizeEl = this.container.querySelector(
         "#setting-batchSize",
       ) as HTMLInputElement;
@@ -2663,6 +2687,15 @@ export class ApiSettingsPage {
               "#setting-requestTimeout",
             ) as HTMLInputElement
           )?.value?.trim() || "300000",
+        deepReadMaxRetries: String(
+          Math.min(
+            5,
+            Math.max(
+              1,
+              parseInt(deepReadMaxRetriesEl?.value?.trim() || "5", 10) || 5,
+            ),
+          ),
+        ),
         batchSize: batchSizeEl?.value?.trim() || "1",
         batchInterval: batchIntervalEl?.value?.trim() || "60",
         scanInterval: scanIntervalEl?.value?.trim() || "300",
@@ -2778,6 +2811,7 @@ export class ApiSettingsPage {
       );
       setPref("requestTimeout", values.requestTimeout);
       // 调度配置
+      setPref("deepReadMaxRetries", values.deepReadMaxRetries);
       setPref("batchSize", values.batchSize);
       setPref("batchInterval", values.batchInterval);
       setPref("scanInterval", values.scanInterval);
@@ -3207,6 +3241,7 @@ export class ApiSettingsPage {
     setPref("stream", true);
     setPref("enablePromptCacheOptimization" as any, false);
     setPref("requestTimeout", "300000");
+    setPref("deepReadMaxRetries", "5");
     setPref("batchSize", "1");
     setPref("batchInterval", "60");
     setPref("scanInterval", "300");

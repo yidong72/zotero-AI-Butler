@@ -186,6 +186,7 @@ export class DataSettingsPage {
       "multiRoundPromptTemplates",
       "multiRoundPromptTemplateId",
       "maxRetries",
+      "deepReadMaxRetries",
       "batchSize",
       "batchInterval",
       "autoScan",
@@ -311,6 +312,7 @@ export class DataSettingsPage {
     setPref("windowWidth", "900");
     setPref("windowHeight", "650");
     setPref("maxRetries", "3");
+    setPref("deepReadMaxRetries", "5");
     setPref("batchSize", "1");
     setPref("batchInterval", "60");
     clearPref("customPrompts");

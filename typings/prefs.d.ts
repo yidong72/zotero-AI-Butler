@@ -59,6 +59,7 @@ declare namespace _ZoteroTypes {
       "multiRoundIndependentMaxConcurrency": number;
       "legacyAiNoteRenamePromptState": string;
       "maxRetries": string;
+      "deepReadMaxRetries": string;
       "batchSize": string;
       "batchInterval": string;
       "autoScan": boolean;

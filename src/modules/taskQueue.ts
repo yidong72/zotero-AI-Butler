@@ -133,6 +133,92 @@ export type TaskType =
   | "review"
   | "targetedQuestion";
 
+export const DEFAULT_DEEP_READ_TASK_MAX_RETRIES = 5;
+const MAX_DEEP_READ_TASK_RETRIES = 5;
+
+export function getTaskRetryLimit(taskType?: TaskType): number {
+  const fixedLimit =
+    taskType === "imageSummary" ||
+    taskType === "mindmap" ||
+    taskType === "tableFill"
+      ? 2
+      : taskType === "review" || taskType === "targetedQuestion"
+        ? 1
+        : null;
+  if (fixedLimit !== null) return fixedLimit;
+
+  if (taskType === "deepRead") {
+    const configured = parseInt(
+      String(getPref("deepReadMaxRetries" as any) || ""),
+      10,
+    );
+    return Math.min(
+      MAX_DEEP_READ_TASK_RETRIES,
+      Math.max(
+        1,
+        Number.isFinite(configured)
+          ? configured
+          : DEFAULT_DEEP_READ_TASK_MAX_RETRIES,
+      ),
+    );
+  }
+
+  const configured = parseInt(String(getPref("maxRetries") || ""), 10);
+  return Math.max(1, Number.isFinite(configured) ? configured : 3);
+}
+
+export function inferTaskType(task: {
+  id?: string;
+  taskType?: TaskType;
+}): TaskType | undefined {
+  if (task.taskType) return task.taskType;
+  const id = String(task.id || "");
+  if (id.startsWith("deepread-task-")) return "deepRead";
+  if (id.startsWith("img-task-")) return "imageSummary";
+  if (id.startsWith("mindmap-task-")) return "mindmap";
+  if (id.startsWith("table-task-")) return "tableFill";
+  if (id.startsWith("review-task-")) return "review";
+  if (id.startsWith("targeted-task-")) return "targetedQuestion";
+  if (id.startsWith("summary-task-") || id.startsWith("task-")) {
+    return "summary";
+  }
+  return undefined;
+}
+
+export function formatDeepReadIncompleteTaskError(
+  reason: string,
+  outcome: "progress" | "retry" | "failed" | "legacyFailed",
+  retryCount: number,
+  maxRetries: number,
+  lang: PromptLang = "zh",
+): string {
+  if (lang === "en") {
+    const base = `AI deep read is incomplete (${reason})`;
+    if (outcome === "progress") {
+      return `${base}. New progress was saved; remaining rounds will continue.`;
+    }
+    if (outcome === "retry") {
+      return `${base}. Unfinished rounds will retry automatically (consecutive no-progress attempts ${retryCount}/${maxRetries}).`;
+    }
+    if (outcome === "legacyFailed") {
+      return `${base}. It previously paused at the old retry limit; choose Retry to continue with the new limit of ${maxRetries} consecutive no-progress attempts.`;
+    }
+    return `${base}. Paused after ${maxRetries} consecutive attempts without new progress; choose Retry to continue.`;
+  }
+
+  const base = `AI 精读尚未完整生成（${reason}）`;
+  if (outcome === "progress") {
+    return `${base}，已保存新进度，将继续补全未完成轮次`;
+  }
+  if (outcome === "retry") {
+    return `${base}，将自动重试未完成轮次（连续无进展 ${retryCount}/${maxRetries}）`;
+  }
+  if (outcome === "legacyFailed") {
+    return `${base}，此前达到旧重试上限并暂停；点击“重试”后将使用新的连续无进展上限 ${maxRetries}`;
+  }
+  return `${base}，连续 ${maxRetries} 次尝试无新进展，已暂停；可点击“重试”继续`;
+}
+
 /**
  * 任务项接口
  */
@@ -343,6 +429,8 @@ export class TaskQueueManager {
       logTaskQueue(`任务正在执行，跳过重复入队: ${task.id}`);
       return false;
     }
+    task.taskType = inferTaskType(task) || artifactType;
+    task.maxRetries = getTaskRetryLimit(task.taskType);
 
     if (task.status === TaskStatus.COMPLETED) {
       const shouldRegenerate = await this.shouldRegenerateCompletedTask(
@@ -507,8 +595,10 @@ export class TaskQueueManager {
     options?: TaskItem["options"],
     workflowStage?: string,
   ): void {
+    task.taskType = inferTaskType(task);
     task.status = priority ? TaskStatus.PRIORITY : TaskStatus.PENDING;
     task.options = options;
+    task.maxRetries = getTaskRetryLimit(task.taskType);
     task.progress = 0;
     task.error = undefined;
     task.errorDetails = undefined;
@@ -616,7 +706,7 @@ export class TaskQueueManager {
           createdAt: new Date(),
           completedAt: new Date(),
           retryCount: 0,
-          maxRetries: parseInt(getPref("maxRetries") as string) || 3,
+          maxRetries: getTaskRetryLimit("summary"),
           taskType: "summary",
           promptLanguage: lang,
           workflowStage: "已存在，跳过生成",
@@ -637,7 +727,7 @@ export class TaskQueueManager {
       progress: 0,
       createdAt: new Date(),
       retryCount: 0,
-      maxRetries: parseInt(getPref("maxRetries") as string) || 3,
+      maxRetries: getTaskRetryLimit("summary"),
       taskType: "summary",
       promptLanguage: lang,
       workflowStage: "等待 AI 总结",
@@ -718,7 +808,7 @@ export class TaskQueueManager {
           createdAt: new Date(),
           completedAt: new Date(),
           retryCount: 0,
-          maxRetries: parseInt(getPref("maxRetries") as string) || 3,
+          maxRetries: getTaskRetryLimit("deepRead"),
           taskType: "deepRead",
           promptLanguage: lang,
           workflowStage: "已存在，跳过生成",
@@ -738,7 +828,7 @@ export class TaskQueueManager {
       progress: 0,
       createdAt: new Date(),
       retryCount: 0,
-      maxRetries: parseInt(getPref("maxRetries") as string) || 3,
+      maxRetries: getTaskRetryLimit("deepRead"),
       taskType: "deepRead",
       promptLanguage: lang,
       workflowStage: "等待 AI 精读",
@@ -830,7 +920,7 @@ export class TaskQueueManager {
       progress: 0,
       createdAt: new Date(),
       retryCount: 0,
-      maxRetries: 2, // 首次失败后再重试 1 次
+      maxRetries: getTaskRetryLimit("imageSummary"),
       taskType: "imageSummary",
       promptLanguage: lang,
       workflowStage: "等待开始",
@@ -1009,7 +1099,7 @@ export class TaskQueueManager {
       progress: 0,
       createdAt: new Date(),
       retryCount: 0,
-      maxRetries: 2,
+      maxRetries: getTaskRetryLimit("mindmap"),
       taskType: "mindmap",
       promptLanguage: lang,
       workflowStage: "等待开始",
@@ -1185,7 +1275,7 @@ export class TaskQueueManager {
       progress: 0,
       createdAt: new Date(),
       retryCount: 0,
-      maxRetries: 2,
+      maxRetries: getTaskRetryLimit("tableFill"),
       taskType: "tableFill",
       workflowStage: "等待开始",
     };
@@ -1358,7 +1448,7 @@ export class TaskQueueManager {
       progress: 0,
       createdAt: new Date(),
       retryCount: 0,
-      maxRetries: 1,
+      maxRetries: getTaskRetryLimit("review"),
       taskType: "review",
       workflowStage: "等待开始",
       collectionId: collection.id,
@@ -1515,7 +1605,7 @@ export class TaskQueueManager {
       progress: 0,
       createdAt: new Date(),
       retryCount: 0,
-      maxRetries: 1,
+      maxRetries: getTaskRetryLimit("targetedQuestion"),
       taskType: "targetedQuestion",
       workflowStage: "等待开始",
       collectionId: collection.id,
@@ -1802,11 +1892,13 @@ export class TaskQueueManager {
     }
 
     // 重置任务状态
+    task.taskType = inferTaskType(task);
     task.status = TaskStatus.PRIORITY; // 优先重试
     task.progress = 0;
     task.error = undefined;
     task.errorDetails = undefined;
     task.retryCount = 0;
+    task.maxRetries = getTaskRetryLimit(task.taskType);
     task.startedAt = undefined;
     task.completedAt = undefined;
     task.duration = undefined;
@@ -2112,6 +2204,8 @@ export class TaskQueueManager {
     if (!task) {
       return false;
     }
+    task.taskType = inferTaskType(task);
+    task.maxRetries = getTaskRetryLimit(task.taskType);
 
     // 非普通总结任务转交到各自执行器，避免误走默认总结流程
     if (
@@ -2237,12 +2331,16 @@ export class TaskQueueManager {
         task.promptLanguage,
       );
       if (!artifact.exists) {
+        const incompleteReason = artifact.reason || "incomplete";
         const incompleteError = new Error(
           artifactType === "deepRead"
-            ? `AI 精读尚未完整生成（${artifact.reason || "incomplete"}），已重新加入队列补全未完成轮次`
-            : `AI 总结尚未完整生成（${artifact.reason || "incomplete"}）`,
+            ? task.promptLanguage === "en"
+              ? `AI deep read is incomplete (${incompleteReason})`
+              : `AI 精读尚未完整生成（${incompleteReason}）`
+            : `AI 总结尚未完整生成（${incompleteReason}）`,
         );
         if (isDeepReadTask) {
+          (incompleteError as any).deepReadIncompleteReason = incompleteReason;
           const currentNote = await AiNoteService.findNote(
             item,
             "deepRead",
@@ -2294,6 +2392,8 @@ export class TaskQueueManager {
         ? TASK_ABORT_DETAIL
         : this.buildTaskErrorDetails(task, error);
       const suppressTaskRetry = this.shouldSuppressTaskRetry(error, task);
+      const deepReadIncompleteReason = (error as any)
+        ?.deepReadIncompleteReason as string | undefined;
 
       // 无 PDF 附件错误直接标记失败，不重试（用户需要手动添加 PDF）
       const isNoPdfError = task.error === NO_PDF_ERROR_MSG;
@@ -2316,6 +2416,15 @@ export class TaskQueueManager {
           // 重置为待处理状态,等待重试
           task.status = TaskStatus.PENDING;
           task.progress = 0;
+          if (deepReadIncompleteReason) {
+            task.error = formatDeepReadIncompleteTaskError(
+              deepReadIncompleteReason,
+              deepReadMadeProgress ? "progress" : "retry",
+              task.retryCount,
+              task.maxRetries,
+              task.promptLanguage,
+            );
+          }
           logTaskQueue(
             deepReadMadeProgress
               ? `AI 精读已保存新进度，将继续补全剩余轮次: ${task.title}`
@@ -2325,8 +2434,21 @@ export class TaskQueueManager {
           // 超过最大重试次数,标记为失败
           task.status = TaskStatus.FAILED;
           task.completedAt = new Date();
+          if (deepReadIncompleteReason) {
+            task.error = formatDeepReadIncompleteTaskError(
+              deepReadIncompleteReason,
+              "failed",
+              task.retryCount,
+              task.maxRetries,
+              task.promptLanguage,
+            );
+          }
           logTaskQueue(`任务最终失败: ${task.title} - ${task.error}`);
         }
+      }
+
+      if (deepReadIncompleteReason) {
+        task.errorDetails = this.buildTaskErrorDetails(task, error, task.error);
       }
 
       this.notifyComplete(taskId, false, task.error);
@@ -2415,7 +2537,11 @@ export class TaskQueueManager {
     );
   }
 
-  private buildTaskErrorDetails(task: TaskItem, error: unknown): string {
+  private buildTaskErrorDetails(
+    task: TaskItem,
+    error: unknown,
+    errorMessageOverride?: string,
+  ): string {
     const errorInfo = error as
       | {
           name?: string;
@@ -2446,7 +2572,7 @@ export class TaskQueueManager {
       `platform: ${runtime.platform || "unknown"}`,
       `userAgent: ${runtime.userAgent || "unknown"}`,
       `errorName: ${errorInfo?.name || "unknown"}`,
-      `errorMessage: ${this.getTaskErrorMessage(error)}`,
+      `errorMessage: ${errorMessageOverride || this.getTaskErrorMessage(error)}`,
       `suppressTaskRetry: ${this.shouldSuppressTaskRetry(error, task)}`,
       `likelyApiFailure: ${this.isLikelyApiFailure(error, task)}`,
     ];
@@ -2659,6 +2785,7 @@ export class TaskQueueManager {
       for (const taskData of data.tasks || []) {
         const task: TaskItem = {
           ...taskData,
+          taskType: inferTaskType(taskData),
           promptLanguage: inferTaskPromptLanguage(taskData),
           createdAt: new Date(taskData.createdAt),
           startedAt: taskData.startedAt
@@ -2668,6 +2795,30 @@ export class TaskQueueManager {
             ? new Date(taskData.completedAt)
             : undefined,
         };
+        task.maxRetries = getTaskRetryLimit(task.taskType);
+        if (
+          task.status === TaskStatus.FAILED &&
+          task.taskType === "deepRead" &&
+          task.error?.includes("已重新加入队列补全未完成轮次")
+        ) {
+          const legacyError = task.error;
+          const reason =
+            legacyError.match(/AI 精读尚未完整生成（([^）]+)）/)?.[1] ||
+            "incomplete";
+          task.error = formatDeepReadIncompleteTaskError(
+            reason,
+            "legacyFailed",
+            task.retryCount,
+            task.maxRetries,
+            task.promptLanguage,
+          );
+          if (task.errorDetails) {
+            task.errorDetails = task.errorDetails.replaceAll(
+              legacyError,
+              task.error,
+            );
+          }
+        }
 
         // 插件重启恢复时，处理中任务无法继续执行，改为待处理重新排队
         if (resetProcessingTasks && task.status === TaskStatus.PROCESSING) {

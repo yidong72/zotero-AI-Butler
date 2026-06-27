@@ -7,6 +7,9 @@ import {
   getImageSummaryTaskId,
   getMindmapTaskId,
   getSummaryTaskId,
+  getTaskRetryLimit,
+  formatDeepReadIncompleteTaskError,
+  inferTaskType,
   inferTaskPromptLanguage,
   type TaskItem,
 } from "../src/modules/taskQueue";
@@ -22,6 +25,7 @@ type QueueInternals = {
   tasks: Map<string, TaskItem>;
   progressCallbacks: Set<(...args: any[]) => void>;
   completeCallbacks: Set<(...args: any[]) => void>;
+  abortingTasks: Set<string>;
   isRunning: boolean;
   addTask(
     item: Zotero.Item,
@@ -46,6 +50,8 @@ type QueueInternals = {
     lang?: PromptLang,
   ): Promise<string>;
   maybeAutoTriggerImageSummary(itemId: number, lang: PromptLang): Promise<void>;
+  retryTask(taskId: string): Promise<void>;
+  loadFromStorage(resetProcessingTasks: boolean): void;
   requeueExistingFixedTask(
     task: TaskItem,
     item: Zotero.Item,
@@ -64,12 +70,16 @@ type QueueInternals = {
 
 const noteStrategyPref = `${config.prefsPrefix}.noteStrategy`;
 const tableStrategyPref = `${config.prefsPrefix}.tableStrategy`;
+const maxRetriesPref = `${config.prefsPrefix}.maxRetries`;
+const deepReadMaxRetriesPref = `${config.prefsPrefix}.deepReadMaxRetries`;
+const taskQueueStoragePref = "extensions.zotero.aibutler.taskQueue";
 
 function createQueueInternals(): QueueInternals {
   const manager = Object.create(TaskQueueManager.prototype) as QueueInternals;
   manager.tasks = new Map();
   manager.progressCallbacks = new Set();
   manager.completeCallbacks = new Set();
+  manager.abortingTasks = new Set();
   manager.isRunning = true;
   manager.saveToStorage = async () => {};
   return manager;
@@ -98,6 +108,9 @@ describe("TaskQueue artifact-aware requeue", function () {
   let originalFindNote: typeof AiNoteService.findNote;
   let originalNoteStrategy: string | number | boolean | null | undefined;
   let originalTableStrategy: string | number | boolean | null | undefined;
+  let originalMaxRetries: string | number | boolean | null | undefined;
+  let originalDeepReadMaxRetries: string | number | boolean | null | undefined;
+  let originalTaskQueueStorage: string | number | boolean | null | undefined;
 
   beforeEach(function () {
     originalProbe = TaskArtifacts.probe;
@@ -114,8 +127,26 @@ describe("TaskQueue artifact-aware requeue", function () {
       | boolean
       | null
       | undefined;
+    originalMaxRetries = Zotero.Prefs.get(maxRetriesPref, true) as
+      | string
+      | number
+      | boolean
+      | null
+      | undefined;
+    originalDeepReadMaxRetries = Zotero.Prefs.get(
+      deepReadMaxRetriesPref,
+      true,
+    ) as string | number | boolean | null | undefined;
+    originalTaskQueueStorage = Zotero.Prefs.get(taskQueueStoragePref, true) as
+      | string
+      | number
+      | boolean
+      | null
+      | undefined;
     Zotero.Prefs.set(noteStrategyPref, "skip", true);
     Zotero.Prefs.set(tableStrategyPref, "skip", true);
+    Zotero.Prefs.set(maxRetriesPref, "3", true);
+    Zotero.Prefs.set(deepReadMaxRetriesPref, "5", true);
   });
 
   afterEach(function () {
@@ -130,6 +161,25 @@ describe("TaskQueue artifact-aware requeue", function () {
       Zotero.Prefs.clear(tableStrategyPref, true);
     } else {
       Zotero.Prefs.set(tableStrategyPref, originalTableStrategy, true);
+    }
+    if (originalMaxRetries == null) {
+      Zotero.Prefs.clear(maxRetriesPref, true);
+    } else {
+      Zotero.Prefs.set(maxRetriesPref, originalMaxRetries, true);
+    }
+    if (originalDeepReadMaxRetries == null) {
+      Zotero.Prefs.clear(deepReadMaxRetriesPref, true);
+    } else {
+      Zotero.Prefs.set(
+        deepReadMaxRetriesPref,
+        originalDeepReadMaxRetries,
+        true,
+      );
+    }
+    if (originalTaskQueueStorage == null) {
+      Zotero.Prefs.clear(taskQueueStoragePref, true);
+    } else {
+      Zotero.Prefs.set(taskQueueStoragePref, originalTaskQueueStorage, true);
     }
   });
 
@@ -247,8 +297,118 @@ describe("TaskQueue artifact-aware requeue", function () {
 
     expect(taskId).to.equal(getDeepReadTaskId(item.id));
     expect(task?.taskType).to.equal("deepRead");
+    expect(task?.maxRetries).to.equal(5);
     expect(task?.options?.summaryMode).to.equal("deepRead");
     expect(manager.tasks.has(getSummaryTaskId(item.id))).to.equal(false);
+  });
+
+  it("bounds the configurable deep-read no-progress budget", function () {
+    expect(getTaskRetryLimit("summary")).to.equal(3);
+    expect(getTaskRetryLimit("deepRead")).to.equal(5);
+
+    Zotero.Prefs.set(deepReadMaxRetriesPref, "4", true);
+    expect(getTaskRetryLimit("deepRead")).to.equal(4);
+    Zotero.Prefs.set(deepReadMaxRetriesPref, "99", true);
+    expect(getTaskRetryLimit("deepRead")).to.equal(5);
+    Zotero.Prefs.set(deepReadMaxRetriesPref, "invalid", true);
+    expect(getTaskRetryLimit("deepRead")).to.equal(5);
+  });
+
+  it("reports retry and final deep-read states without false requeue claims", function () {
+    const retryMessage = formatDeepReadIncompleteTaskError(
+      "deep-read-placeholder-residual",
+      "retry",
+      3,
+      5,
+      "zh",
+    );
+    const failedMessage = formatDeepReadIncompleteTaskError(
+      "deep-read-placeholder-residual",
+      "failed",
+      5,
+      5,
+      "zh",
+    );
+
+    expect(retryMessage).to.include("将自动重试");
+    expect(retryMessage).to.include("3/5");
+    expect(failedMessage).to.include("已暂停");
+    expect(failedMessage).to.include("点击“重试”继续");
+    expect(failedMessage).to.not.include("已重新加入队列");
+  });
+
+  it("upgrades a persisted failed deep-read task when manually retried", async function () {
+    const manager = createQueueInternals();
+    const task = createTask(TaskStatus.FAILED);
+    task.id = "deepread-task-1";
+    task.taskType = undefined;
+    task.maxRetries = 3;
+    manager.tasks.set(task.id, task);
+
+    await manager.retryTask(task.id);
+
+    expect(inferTaskType(task)).to.equal("deepRead");
+    expect(task.taskType).to.equal("deepRead");
+    expect(task.status).to.equal(TaskStatus.PRIORITY);
+    expect(task.retryCount).to.equal(0);
+    expect(task.maxRetries).to.equal(5);
+  });
+
+  it("normalizes the old retry budget when loading a persisted failed deep-read task", function () {
+    const manager = createQueueInternals();
+    Zotero.Prefs.set(
+      taskQueueStoragePref,
+      JSON.stringify({
+        savedAt: "2026-06-27T00:00:00.000Z",
+        tasks: [
+          {
+            ...createTask(TaskStatus.FAILED),
+            id: "deepread-task-1",
+            taskType: undefined,
+            retryCount: 3,
+            maxRetries: 3,
+            error:
+              "AI 精读尚未完整生成（deep-read-placeholder-residual），已重新加入队列补全未完成轮次",
+            errorDetails:
+              "errorMessage: AI 精读尚未完整生成（deep-read-placeholder-residual），已重新加入队列补全未完成轮次",
+          },
+        ],
+      }),
+      true,
+    );
+
+    manager.loadFromStorage(false);
+    const restored = manager.tasks.get("deepread-task-1");
+
+    expect(restored?.status).to.equal(TaskStatus.FAILED);
+    expect(restored?.taskType).to.equal("deepRead");
+    expect(restored?.retryCount).to.equal(3);
+    expect(restored?.maxRetries).to.equal(5);
+    expect(restored?.error).to.include("此前达到旧重试上限并暂停");
+    expect(restored?.error).to.include("新的连续无进展上限 5");
+    expect(restored?.error).to.not.include("已重新加入队列");
+    expect(restored?.errorDetails).to.include("此前达到旧重试上限并暂停");
+    expect(restored?.errorDetails).to.not.include("已重新加入队列");
+  });
+
+  it("refreshes the retry budget for an already pending deep-read task", async function () {
+    const manager = createQueueInternals();
+    const task = createTask(TaskStatus.PENDING);
+    task.id = "deepread-task-1";
+    task.taskType = "deepRead";
+    task.maxRetries = 3;
+
+    const shouldRun = await manager.requeueExistingFixedTask(
+      task,
+      item,
+      "deepRead",
+      false,
+      { summaryMode: "deepRead" },
+    );
+
+    expect(shouldRun).to.equal(true);
+    expect(task.status).to.equal(TaskStatus.PENDING);
+    expect(task.maxRetries).to.equal(5);
   });
 
   it("requeues a completed summary task when the artifact is missing", async function () {
