@@ -36,6 +36,8 @@ import {
 } from "./llmproviders/shared/requestAbort";
 import { TaskArtifacts, type FixedTaskArtifactType } from "./taskArtifacts";
 import { isTableFeatureEnabled } from "./uiCustomization";
+import { AiNoteService } from "./aiNoteService";
+import { countCompletedDeepReadSlots } from "./deepReadEngine";
 
 function logTaskQueue(...args: Parameters<ZToolkit["log"]>): void {
   try {
@@ -184,6 +186,29 @@ export function getDeepReadTaskId(
   return lang === "en"
     ? `deepread-task-${itemId}-en`
     : `deepread-task-${itemId}`;
+}
+
+export function getImageSummaryTaskId(
+  itemId: number,
+  lang: PromptLang = "zh",
+): string {
+  return lang === "en" ? `img-task-${itemId}-en` : `img-task-${itemId}`;
+}
+
+export function getMindmapTaskId(
+  itemId: number,
+  lang: PromptLang = "zh",
+): string {
+  return lang === "en" ? `mindmap-task-${itemId}-en` : `mindmap-task-${itemId}`;
+}
+
+/** Recover language for queue snapshots saved before promptLanguage was persisted. */
+export function inferTaskPromptLanguage(task: {
+  id: string;
+  promptLanguage?: PromptLang;
+}): PromptLang {
+  if (task.promptLanguage === "en") return "en";
+  return /-en$/.test(task.id) ? "en" : "zh";
 }
 
 export function getLegacySummaryTaskId(itemId: number): string {
@@ -593,6 +618,7 @@ export class TaskQueueManager {
           retryCount: 0,
           maxRetries: parseInt(getPref("maxRetries") as string) || 3,
           taskType: "summary",
+          promptLanguage: lang,
           workflowStage: "已存在，跳过生成",
           options: summaryOptions,
           duration: 0,
@@ -694,6 +720,7 @@ export class TaskQueueManager {
           retryCount: 0,
           maxRetries: parseInt(getPref("maxRetries") as string) || 3,
           taskType: "deepRead",
+          promptLanguage: lang,
           workflowStage: "已存在，跳过生成",
           options: deepReadOptions,
           duration: 0,
@@ -767,8 +794,7 @@ export class TaskQueueManager {
     priority: boolean = true,
     lang: PromptLang = "zh",
   ): Promise<string> {
-    const taskId =
-      lang === "en" ? `img-task-${item.id}-en` : `img-task-${item.id}`;
+    const taskId = getImageSummaryTaskId(item.id, lang);
 
     // 检查是否已存在
     if (this.tasks.has(taskId)) {
@@ -804,7 +830,7 @@ export class TaskQueueManager {
       progress: 0,
       createdAt: new Date(),
       retryCount: 0,
-      maxRetries: 1, // 一图总结只重试1次
+      maxRetries: 2, // 首次失败后再重试 1 次
       taskType: "imageSummary",
       promptLanguage: lang,
       workflowStage: "等待开始",
@@ -947,8 +973,7 @@ export class TaskQueueManager {
     priority: boolean = true,
     lang: PromptLang = "zh",
   ): Promise<string> {
-    const taskId =
-      lang === "en" ? `mindmap-task-${item.id}-en` : `mindmap-task-${item.id}`;
+    const taskId = getMindmapTaskId(item.id, lang);
 
     // 检查是否已存在
     if (this.tasks.has(taskId)) {
@@ -2139,6 +2164,7 @@ export class TaskQueueManager {
     this.taskAbortControllers.set(taskId, abortController);
     await this.saveToStorage();
     const isDeepReadTask = task.taskType === "deepRead";
+    let completedDeepReadSlotsBefore = 0;
     task.workflowStage = isDeepReadTask ? "正在 AI 精读" : "正在 AI 总结";
     this.notifyProgress(
       taskId,
@@ -2153,6 +2179,17 @@ export class TaskQueueManager {
       const item = await Zotero.Items.getAsync(task.itemId);
       if (!item) {
         throw new Error("文献条目不存在");
+      }
+
+      if (isDeepReadTask) {
+        const existingNote = await AiNoteService.findNote(
+          item,
+          "deepRead",
+          task.promptLanguage,
+        );
+        completedDeepReadSlotsBefore = countCompletedDeepReadSlots(
+          ((existingNote as any)?.getNote?.() as string) || "",
+        );
       }
 
       // 检查是否有 PDF 附件
@@ -2200,11 +2237,24 @@ export class TaskQueueManager {
         task.promptLanguage,
       );
       if (!artifact.exists) {
-        throw new Error(
+        const incompleteError = new Error(
           artifactType === "deepRead"
             ? `AI 精读尚未完整生成（${artifact.reason || "incomplete"}），已重新加入队列补全未完成轮次`
             : `AI 总结尚未完整生成（${artifact.reason || "incomplete"}）`,
         );
+        if (isDeepReadTask) {
+          const currentNote = await AiNoteService.findNote(
+            item,
+            "deepRead",
+            task.promptLanguage,
+          );
+          const completedAfter = countCompletedDeepReadSlots(
+            ((currentNote as any)?.getNote?.() as string) || "",
+          );
+          (incompleteError as any).deepReadMadeProgress =
+            completedAfter > completedDeepReadSlotsBefore;
+        }
+        throw incompleteError;
       }
 
       if (this.abortingTasks.has(taskId) || abortController.signal.aborted) {
@@ -2225,7 +2275,10 @@ export class TaskQueueManager {
       this.notifyStream(taskId, { type: "finish" });
       // 自动触发一图总结（如果设置已启用且是普通总结任务）
       if (!task.taskType || task.taskType === "summary") {
-        this.maybeAutoTriggerImageSummary(task.itemId);
+        this.maybeAutoTriggerImageSummary(
+          task.itemId,
+          task.promptLanguage || "zh",
+        );
       }
       return false; // 非快速失败，计入批次
     } catch (error: any) {
@@ -2255,14 +2308,18 @@ export class TaskQueueManager {
               : `任务失败（API 尝试已用尽，不再进行队列重试）: ${task.title}`,
         );
       } else {
-        task.retryCount++;
+        const deepReadMadeProgress =
+          isDeepReadTask && (error as any)?.deepReadMadeProgress === true;
+        task.retryCount = deepReadMadeProgress ? 0 : task.retryCount + 1;
         // 检查是否需要重试
-        if (task.retryCount < task.maxRetries) {
+        if (deepReadMadeProgress || task.retryCount < task.maxRetries) {
           // 重置为待处理状态,等待重试
           task.status = TaskStatus.PENDING;
           task.progress = 0;
           logTaskQueue(
-            `任务失败,将重试 (${task.retryCount}/${task.maxRetries}): ${task.title}`,
+            deepReadMadeProgress
+              ? `AI 精读已保存新进度，将继续补全剩余轮次: ${task.title}`
+              : `任务失败,将重试 (${task.retryCount}/${task.maxRetries}): ${task.title}`,
           );
         } else {
           // 超过最大重试次数,标记为失败
@@ -2541,7 +2598,10 @@ export class TaskQueueManager {
    * 检查是否应该自动触发一图总结
    * 只有当设置启用且任务是普通总结任务时才触发
    */
-  private async maybeAutoTriggerImageSummary(itemId: number): Promise<void> {
+  private async maybeAutoTriggerImageSummary(
+    itemId: number,
+    lang: PromptLang,
+  ): Promise<void> {
     try {
       const { getPref } = await import("../utils/prefs");
       const autoTrigger =
@@ -2558,7 +2618,7 @@ export class TaskQueueManager {
       }
 
       logTaskQueue(`[AI-Butler] 自动触发一图总结: ${item.getField("title")}`);
-      await this.addImageSummaryTask(item);
+      await this.addImageSummaryTask(item, true, lang);
     } catch (error) {
       logTaskQueue(`[AI-Butler] 自动触发一图总结失败:`, error);
     }
@@ -2599,6 +2659,7 @@ export class TaskQueueManager {
       for (const taskData of data.tasks || []) {
         const task: TaskItem = {
           ...taskData,
+          promptLanguage: inferTaskPromptLanguage(taskData),
           createdAt: new Date(taskData.createdAt),
           startedAt: taskData.startedAt
             ? new Date(taskData.startedAt)

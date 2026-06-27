@@ -29,6 +29,16 @@ import {
 /** NVIDIA Inference 默认端点 */
 export const NV_INFERENCE_DEFAULT_URL = "https://inference-api.nvidia.com";
 
+export function normalizeNvInferenceBaseUrl(value?: string): string {
+  const configured = (value || "").trim();
+  return (configured || NV_INFERENCE_DEFAULT_URL)
+    .replace(/\/+$/, "")
+    .replace(
+      /\/v1(?:\/(?:responses|messages|models|chat\/completions))?$/i,
+      "",
+    );
+}
+
 export class NvInferenceProvider implements ILlmProvider {
   readonly id = "nvinference";
 
@@ -68,10 +78,7 @@ export class NvInferenceProvider implements ILlmProvider {
     impl: ILlmProvider;
     options: LLMOptions;
   } {
-    const base = (options.apiUrl || NV_INFERENCE_DEFAULT_URL).replace(
-      /\/+$/,
-      "",
-    );
+    const base = normalizeNvInferenceBaseUrl(options.apiUrl);
     // NVIDIA Inference 上的新版模型不接受采样参数：Claude 4.x 会报
     // "temperature is deprecated"，GPT-5.x 会报 "top_p cannot be used"。
     // 统一剥离 temperature / topP，仅使用模型默认采样。
@@ -120,9 +127,7 @@ export class NvInferenceProvider implements ILlmProvider {
    */
   async listModels(options: LLMOptions): Promise<LLMModelInfo[]> {
     const apiKey = (options.apiKey || "").trim();
-    const base = (options.apiUrl || NV_INFERENCE_DEFAULT_URL)
-      .trim()
-      .replace(/\/+$/, "");
+    const base = normalizeNvInferenceBaseUrl(options.apiUrl);
     if (!base) throw new Error("API URL 未配置");
     if (!apiKey) throw new Error("API Key 未配置");
 

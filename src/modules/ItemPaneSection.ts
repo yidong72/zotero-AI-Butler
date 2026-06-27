@@ -2271,7 +2271,7 @@ async function loadMindmapContent(
         // 优先检查标签，其次检查标题（支持新旧格式）
         const isMindmapNote =
           tags.some((t) => t.tag === "AI-Mindmap") ||
-          /AI\s*管家思维导图\s*-/.test(noteHtml);
+          /AI\s*(?:管家思维导图|Mindmap)\s*-/i.test(noteHtml);
 
         if (isMindmapNote) {
           if (!mindmapNote) {
@@ -3717,7 +3717,19 @@ async function resolveSidebarSummaryNote(
   item: Zotero.Item,
   kind: AiNoteKind = "summary",
 ): Promise<SidebarSummaryNote | null> {
-  const record = await AiNoteService.findNoteRecord(item, kind);
+  const records = await Promise.all([
+    AiNoteService.findNoteRecord(item, kind, "zh"),
+    AiNoteService.findNoteRecord(item, kind, "en"),
+  ]);
+  const record = records
+    .filter((candidate): candidate is NonNullable<typeof candidate> =>
+      Boolean(candidate),
+    )
+    .sort((left, right) => {
+      const leftModified = String((left.note as any).dateModified || "");
+      const rightModified = String((right.note as any).dateModified || "");
+      return rightModified.localeCompare(leftModified);
+    })[0];
   return record ? { note: record.note, rawHtml: record.rawHtml } : null;
 }
 
@@ -4890,8 +4902,17 @@ async function loadImageSummary(
 
     // 查找一图总结笔记
     const { ImageNoteGenerator } = await import("./imageNoteGenerator");
-    const imageNote =
-      await ImageNoteGenerator.findExistingImageNote(targetItem);
+    const imageNotes = await Promise.all([
+      ImageNoteGenerator.findExistingImageNote(targetItem, "zh"),
+      ImageNoteGenerator.findExistingImageNote(targetItem, "en"),
+    ]);
+    const imageNote = imageNotes
+      .filter((candidate): candidate is Zotero.Item => Boolean(candidate))
+      .sort((left, right) =>
+        String((right as any).dateModified || "").localeCompare(
+          String((left as any).dateModified || ""),
+        ),
+      )[0];
 
     if (!imageNote) {
       // 显示生成按钮

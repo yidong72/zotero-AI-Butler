@@ -854,6 +854,9 @@ export class LLMService {
     optionsOrWarnings: LLMOptions | string[],
     maybeWarnings?: string[],
   ): LLMResponse {
+    if (!text || !text.trim()) {
+      throw new Error("LLM 接口返回内容为空，将自动重试");
+    }
     const endpoint =
       "providerType" in endpointOrOptions ? endpointOrOptions : undefined;
     const options = endpoint
@@ -870,6 +873,10 @@ export class LLMService {
         endpoint?.name || LLMEndpointManager.providerLabel(providerId),
       model: options.model,
       generatedAt: new Date().toISOString(),
+      finishReason:
+        typeof options.vendorOptions?.responseFinishReason === "string"
+          ? options.vendorOptions.responseFinishReason
+          : undefined,
       warnings: warnings.length > 0 ? warnings : undefined,
     };
   }

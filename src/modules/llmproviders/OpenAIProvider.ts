@@ -17,10 +17,11 @@ import {
   parseModelListResponse,
   requestModelListJson,
 } from "./shared/modelList";
+import { parseOpenAIResponsesText } from "./shared/openaiResponses";
 import {
-  parseOpenAIResponsesDelta,
-  parseOpenAIResponsesText,
-} from "./shared/openaiResponses";
+  assertOpenAIResponsesComplete,
+  OpenAIResponsesStreamCollector,
+} from "./shared/openaiResponsesStream";
 import { resolveOpenAIReasoningEffort } from "./shared/reasoning";
 import {
   bindAbortSignal,
@@ -109,117 +110,89 @@ export class OpenAIProvider implements ILlmProvider {
 
       if (streamEnabled && onProgress) {
         const payload = { ...basePayload, stream: true } as any;
-        const chunks: string[] = [];
-        let delivered = 0;
-        let processedLength = 0;
-        let partialLine = "";
-        let gotAnyDelta = false;
+        const collector = new OpenAIResponsesStreamCollector();
         let abortError: Error | null = null;
         let cleanupAbortSignal: (() => void) | undefined;
 
         try {
-          await Zotero.HTTP.request("POST", responsesUrl, {
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${apiKey}`,
-            },
-            body: JSON.stringify(payload),
-            responseType: "text",
-            timeout: options.requestTimeoutMs ?? getRequestTimeoutMs(),
-            errorDelayMax: 0,
-            requestObserver: (xmlhttp: XMLHttpRequest) => {
-              cleanupAbortSignal = bindAbortSignal(
-                options.abortSignal,
-                xmlhttp,
-                (error) => {
-                  abortError = error;
-                },
-              );
-              xmlhttp.onprogress = (e: any) => {
-                const status = e.target.status;
-                if (status >= 400) {
-                  try {
-                    const errorResponse = e.target.response;
-                    const parsed = errorResponse
-                      ? JSON.parse(errorResponse)
-                      : null;
-                    const err = parsed?.error || parsed || {};
-                    const code = err?.code || `HTTP ${status}`;
-                    const msg = err?.message || "请求失败";
-                    abortError = new Error(`${code}: ${msg}`);
-                    xmlhttp.abort();
-                  } catch {
-                    abortError = new Error(`HTTP ${status}: 请求失败`);
-                    xmlhttp.abort();
-                  }
-                  return;
-                }
-
-                try {
-                  const resp: string = e.target.response || "";
-                  if (resp.length > processedLength) {
-                    const slice = partialLine + resp.slice(processedLength);
-                    processedLength = resp.length;
-                    const parts = slice.split(/\r?\n/);
-                    partialLine =
-                      parts[parts.length - 1].indexOf("data:") === 0 &&
-                      slice.indexOf("\n", slice.length - 1) === slice.length - 1
-                        ? ""
-                        : parts.pop() || "";
-
-                    for (const raw of parts) {
-                      if (raw.indexOf("data:") !== 0) continue;
-                      const jsonStr = raw.replace(/^data:\s*/, "").trim();
-                      if (!jsonStr || jsonStr === "[DONE]") continue;
-                      try {
-                        const evt = JSON.parse(jsonStr);
-                        const delta = parseOpenAIResponsesDelta(evt);
-                        if (delta) {
-                          gotAnyDelta = true;
-                          chunks.push(delta);
-                          const current = chunks.join("");
-                          if (onProgress && current.length > delivered) {
-                            const newChunk = current.slice(delivered);
-                            delivered = current.length;
-                            Promise.resolve(onProgress(newChunk)).catch((err) =>
-                              ztoolkit.log(
-                                "[AI-Butler] onProgress error (OpenAI Responses SSE):",
-                                err,
-                              ),
-                            );
-                          }
-                        }
-                      } catch {
-                        /* ignore */
-                      }
+          const finalResponse = await Zotero.HTTP.request(
+            "POST",
+            responsesUrl,
+            {
+              headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${apiKey}`,
+              },
+              body: JSON.stringify(payload),
+              responseType: "text",
+              timeout: options.requestTimeoutMs ?? getRequestTimeoutMs(),
+              errorDelayMax: 0,
+              requestObserver: (xmlhttp: XMLHttpRequest) => {
+                cleanupAbortSignal = bindAbortSignal(
+                  options.abortSignal,
+                  xmlhttp,
+                  (error) => {
+                    abortError = error;
+                  },
+                );
+                xmlhttp.onprogress = (e: any) => {
+                  const status = e.target.status;
+                  if (status >= 400) {
+                    try {
+                      const errorResponse = e.target.response;
+                      const parsed = errorResponse
+                        ? JSON.parse(errorResponse)
+                        : null;
+                      const err = parsed?.error || parsed || {};
+                      const code = err?.code || `HTTP ${status}`;
+                      const msg = err?.message || "请求失败";
+                      abortError = new Error(`${code}: ${msg}`);
+                      xmlhttp.abort();
+                    } catch {
+                      abortError = new Error(`HTTP ${status}: 请求失败`);
+                      xmlhttp.abort();
                     }
+                    return;
                   }
-                } catch (err) {
-                  ztoolkit.log(
-                    "[AI-Butler] OpenAI Responses SSE parse error:",
-                    err,
-                  );
-                }
-              };
-              xmlhttp.onerror = () => {
-                if (!abortError)
-                  abortError = new Error("NetworkError: XHR onerror");
-              };
-              xmlhttp.ontimeout = () => {
-                if (!abortError)
-                  abortError = new Error(
-                    `Timeout: 请求超过 ${options.requestTimeoutMs ?? getRequestTimeoutMs()} ms`,
-                  );
-              };
+
+                  try {
+                    const resp: string = e.target.response || "";
+                    this.emitResponsesProgress(
+                      collector.consumeCumulative(resp),
+                      onProgress,
+                      "OpenAI Responses SSE",
+                    );
+                  } catch (err) {
+                    ztoolkit.log(
+                      "[AI-Butler] OpenAI Responses SSE parse error:",
+                      err,
+                    );
+                  }
+                };
+                xmlhttp.onerror = () => {
+                  if (!abortError)
+                    abortError = new Error("NetworkError: XHR onerror");
+                };
+                xmlhttp.ontimeout = () => {
+                  if (!abortError)
+                    abortError = new Error(
+                      `Timeout: 请求超过 ${options.requestTimeoutMs ?? getRequestTimeoutMs()} ms`,
+                    );
+                };
+              },
             },
-          });
+          );
+          this.emitResponsesProgress(
+            collector.consumeCumulative(String(finalResponse.response || "")),
+            onProgress,
+            "OpenAI Responses SSE",
+          );
         } catch (error: any) {
           const currentAbortError = abortError as Error | null;
           if (currentAbortError) {
             if (isAbortError(currentAbortError, options.abortSignal)) {
               throw normalizeAbortError(currentAbortError, options.abortSignal);
             }
-            if (gotAnyDelta && chunks.length > 0) return chunks.join("");
             throw currentAbortError;
           }
           if (isAbortError(error, options.abortSignal)) {
@@ -242,13 +215,17 @@ export class OpenAIProvider implements ILlmProvider {
           } catch {
             /* ignore */
           }
-          if (gotAnyDelta && chunks.length > 0) return chunks.join("");
           throw new Error(errorMessage);
         } finally {
           cleanupAbortSignal?.();
         }
 
-        return chunks.join("");
+        this.emitResponsesProgress(
+          collector.finish(),
+          onProgress,
+          "OpenAI Responses SSE",
+        );
+        return collector.result();
       }
 
       // 非流式
@@ -276,6 +253,7 @@ export class OpenAIProvider implements ILlmProvider {
         });
         throwIfAborted(options.abortSignal);
         const data = res.response || res;
+        assertOpenAIResponsesComplete(data);
         const text = parseOpenAIResponsesText(data);
         if (onProgress && text) await onProgress(text);
         return text;
@@ -590,7 +568,9 @@ export class OpenAIProvider implements ILlmProvider {
             },
           });
           throwIfAborted(options.abortSignal);
-          const text = parseOpenAIResponsesText(res.response || res);
+          const data = res.response || res;
+          assertOpenAIResponsesComplete(data);
+          const text = parseOpenAIResponsesText(data);
           if (onProgress && text) await onProgress(text);
           return text;
         } catch (error: any) {
@@ -622,16 +602,12 @@ export class OpenAIProvider implements ILlmProvider {
 
       const payload: any = { ...basePayload, stream: true };
 
-      const chunks: string[] = [];
-      let delivered = 0;
-      let processedLength = 0;
-      let partialLine = "";
-      let gotAnyDelta = false;
+      const collector = new OpenAIResponsesStreamCollector();
       let abortError: Error | null = null;
       let cleanupAbortSignal: (() => void) | undefined;
 
       try {
-        await Zotero.HTTP.request("POST", responsesUrl, {
+        const finalResponse = await Zotero.HTTP.request("POST", responsesUrl, {
           headers: {
             "Content-Type": "application/json",
             Authorization: `Bearer ${apiKey}`,
@@ -670,43 +646,11 @@ export class OpenAIProvider implements ILlmProvider {
 
               try {
                 const resp: string = e.target.response || "";
-                if (resp.length > processedLength) {
-                  const slice = partialLine + resp.slice(processedLength);
-                  processedLength = resp.length;
-                  const parts = slice.split(/\r?\n/);
-                  partialLine =
-                    parts[parts.length - 1].indexOf("data:") === 0 &&
-                    slice.indexOf("\n", slice.length - 1) === slice.length - 1
-                      ? ""
-                      : parts.pop() || "";
-
-                  for (const raw of parts) {
-                    if (raw.indexOf("data:") !== 0) continue;
-                    const jsonStr = raw.replace(/^data:\s*/, "").trim();
-                    if (!jsonStr || jsonStr === "[DONE]") continue;
-                    try {
-                      const evt = JSON.parse(jsonStr);
-                      const delta = parseOpenAIResponsesDelta(evt);
-                      if (delta) {
-                        gotAnyDelta = true;
-                        chunks.push(delta);
-                        const current = chunks.join("");
-                        if (onProgress && current.length > delivered) {
-                          const newChunk = current.slice(delivered);
-                          delivered = current.length;
-                          Promise.resolve(onProgress(newChunk)).catch((err) =>
-                            ztoolkit.log(
-                              "[AI-Butler] onProgress error (OpenAI Responses chat SSE):",
-                              err,
-                            ),
-                          );
-                        }
-                      }
-                    } catch {
-                      /* ignore */
-                    }
-                  }
-                }
+                this.emitResponsesProgress(
+                  collector.consumeCumulative(resp),
+                  onProgress,
+                  "OpenAI Responses chat SSE",
+                );
               } catch (err) {
                 ztoolkit.log(
                   "[AI-Butler] OpenAI Responses chat SSE parse error:",
@@ -726,12 +670,16 @@ export class OpenAIProvider implements ILlmProvider {
             };
           },
         });
+        this.emitResponsesProgress(
+          collector.consumeCumulative(String(finalResponse.response || "")),
+          onProgress,
+          "OpenAI Responses chat SSE",
+        );
       } catch (error: any) {
         if (abortError) {
           if (isAbortError(abortError, options.abortSignal)) {
             throw normalizeAbortError(abortError, options.abortSignal);
           }
-          if (gotAnyDelta && chunks.length > 0) return chunks.join("");
           throw abortError;
         }
         if (isAbortError(error, options.abortSignal)) {
@@ -754,13 +702,17 @@ export class OpenAIProvider implements ILlmProvider {
         } catch {
           /* ignore */
         }
-        if (gotAnyDelta && chunks.length > 0) return chunks.join("");
         throw new Error(errorMessage);
       } finally {
         cleanupAbortSignal?.();
       }
 
-      return chunks.join("");
+      this.emitResponsesProgress(
+        collector.finish(),
+        onProgress,
+        "OpenAI Responses chat SSE",
+      );
+      return collector.result();
     }
 
     // 文本模式
@@ -1192,16 +1144,12 @@ export class OpenAIProvider implements ILlmProvider {
     const payload = { model, input, stream: true } as any;
     this.applyResponsesReasoning(payload, model, options);
 
-    const chunks: string[] = [];
-    let delivered = 0;
-    let processedLength = 0;
-    let partialLine = "";
-    let gotAnyDelta = false;
+    const collector = new OpenAIResponsesStreamCollector();
     let abortError: Error | null = null;
     let cleanupAbortSignal: (() => void) | undefined;
 
     try {
-      await Zotero.HTTP.request("POST", responsesUrl, {
+      const finalResponse = await Zotero.HTTP.request("POST", responsesUrl, {
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${apiKey}`,
@@ -1238,46 +1186,11 @@ export class OpenAIProvider implements ILlmProvider {
 
             try {
               const resp: string = e.target.response || "";
-              if (resp.length > processedLength) {
-                const slice = partialLine + resp.slice(processedLength);
-                processedLength = resp.length;
-                const parts = slice.split(/\r?\n/);
-                partialLine =
-                  parts[parts.length - 1].indexOf("data:") === 0 &&
-                  slice.indexOf("\n", slice.length - 1) === slice.length - 1
-                    ? ""
-                    : parts.pop() || "";
-
-                for (const raw of parts) {
-                  if (raw.indexOf("data:") !== 0) continue;
-                  const jsonStr = raw.replace(/^data:\s*/, "").trim();
-                  if (!jsonStr || jsonStr === "[DONE]") continue;
-                  try {
-                    const evt = JSON.parse(jsonStr);
-                    const t = evt?.type as string;
-                    if (
-                      t === "response.output_text.delta" &&
-                      typeof evt.delta === "string"
-                    ) {
-                      gotAnyDelta = true;
-                      chunks.push(evt.delta);
-                      const current = chunks.join("");
-                      if (onProgress && current.length > delivered) {
-                        const newChunk = current.slice(delivered);
-                        delivered = current.length;
-                        Promise.resolve(onProgress(newChunk)).catch((err) =>
-                          ztoolkit.log(
-                            "[AI-Butler] onProgress error (OpenAI multi-PDF):",
-                            err,
-                          ),
-                        );
-                      }
-                    }
-                  } catch {
-                    /* ignore */
-                  }
-                }
-              }
+              this.emitResponsesProgress(
+                collector.consumeCumulative(resp),
+                onProgress,
+                "OpenAI multi-PDF",
+              );
             } catch (err) {
               ztoolkit.log(
                 "[AI-Butler] OpenAI multi-PDF SSE parse error:",
@@ -1297,12 +1210,16 @@ export class OpenAIProvider implements ILlmProvider {
           };
         },
       });
+      this.emitResponsesProgress(
+        collector.consumeCumulative(String(finalResponse.response || "")),
+        onProgress,
+        "OpenAI multi-PDF",
+      );
     } catch (error: any) {
       if (abortError) {
         if (isAbortError(abortError, options.abortSignal)) {
           throw normalizeAbortError(abortError, options.abortSignal);
         }
-        if (gotAnyDelta && chunks.length > 0) return chunks.join("");
         throw abortError;
       }
       if (isAbortError(error, options.abortSignal)) {
@@ -1325,15 +1242,30 @@ export class OpenAIProvider implements ILlmProvider {
       } catch {
         /* ignore */
       }
-      if (gotAnyDelta && chunks.length > 0) return chunks.join("");
       throw new Error(errorMessage);
     } finally {
       cleanupAbortSignal?.();
     }
 
-    const streamed = chunks.join("");
-    if (gotAnyDelta && streamed) return streamed;
-    return "";
+    this.emitResponsesProgress(
+      collector.finish(),
+      onProgress,
+      "OpenAI multi-PDF",
+    );
+    return collector.result();
+  }
+
+  private emitResponsesProgress(
+    chunks: string[],
+    onProgress: ProgressCb | undefined,
+    label: string,
+  ): void {
+    if (!onProgress) return;
+    for (const chunk of chunks) {
+      Promise.resolve(onProgress(chunk)).catch((error) => {
+        ztoolkit.log(`[AI-Butler] onProgress error (${label}):`, error);
+      });
+    }
   }
 
   private applyResponsesReasoning(

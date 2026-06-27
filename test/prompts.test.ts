@@ -13,15 +13,19 @@ import {
 } from "../src/utils/prompts";
 import {
   buildDeepReadSkeletonHtml,
+  countCompletedDeepReadSlots,
   extractDeepReadChaptersFromHtml,
   extractDeepReadPlanMetadata,
+  extractRunnableDeepReadSlotIds,
   fillDeepReadSlot,
   getDeepReadSlotStatus,
   isDeepReadSlotDone,
   markDeepReadSlotRunning,
   planDeepReadSlots,
+  recoverDeepReadFromResidualHtml,
   resetRunningDeepReadSlots,
   shouldRunDeepReadSlot,
+  hasDeepReadV2Slots,
 } from "../src/modules/deepReadEngine";
 
 function v2Template(id = "custom"): MultiRoundPromptTemplate {
@@ -209,13 +213,23 @@ describe("multi-round prompt templates v2", function () {
       "q2",
     ]);
     expect(getDeepReadSlotStatus(filled, "chapter_ch1")).to.equal("done");
-    expect(html).to.include("<h1>AI 精读 - Paper</h1>");
+    expect(html).to.match(/<h1>AI 精读 - Paper[\s\S]*?<\/h1>/);
     expect(html).to.include("<h2>章节解析</h2>");
     expect(html).to.include("<p>第1章：引言（Introduction）</p>");
     expect(html).to.not.include("逐章精读 ⓘ");
-    expect(filled).to.include("<h2>引言</h2>");
+    expect(filled).to.match(/<h2>[\s\S]*?引言<\/h2>/);
     expect(shouldRunDeepReadSlot(filled, "chapter_ch1")).to.equal(false);
     expect(shouldRunDeepReadSlot(filled, "chapter_ch2")).to.equal(true);
+  });
+
+  it("renders an English deep-read skeleton without changing Chinese defaults", function () {
+    const template = v2Template();
+    const planned = planDeepReadSlots(template, DEFAULT_CHAPTER_FALLBACKS);
+    const html = buildDeepReadSkeletonHtml("Paper", template, planned, "en");
+
+    expect(html).to.match(/<h1>AI Deep Read - Paper[\s\S]*?<\/h1>/);
+    expect(html).to.include("<h2>Chapter Structure</h2>");
+    expect(html).to.include("<p>Chapter 1: Introduction (引言)</p>");
   });
 
   it("persists plan metadata and marks running slots", function () {
@@ -233,6 +247,96 @@ describe("multi-round prompt templates v2", function () {
     const reset = resetRunningDeepReadSlots(running);
     expect(getDeepReadSlotStatus(reset, "chapter_ch1")).to.equal("pending");
     expect(reset).to.include("<!-- zab:slot:chapter_ch1:pending -->");
+  });
+
+  it("resumes from durable markers after Zotero removes HTML comments", function () {
+    const template = v2Template();
+    const planned = planDeepReadSlots(template, DEFAULT_CHAPTER_FALLBACKS);
+    const html = fillDeepReadSlot(
+      buildDeepReadSkeletonHtml("Paper", template, planned),
+      "chapter_ch1",
+      "## Introduction\n\nCompleted content",
+      "引言",
+    );
+    const sanitized = html.replace(/<!--[\s\S]*?-->/g, "");
+
+    expect(hasDeepReadV2Slots(sanitized)).to.equal(true);
+    expect(getDeepReadSlotStatus(sanitized, "chapter_ch1")).to.equal("done");
+    expect(countCompletedDeepReadSlots(sanitized)).to.equal(1);
+    expect(extractRunnableDeepReadSlotIds(sanitized)).to.deep.equal([
+      "chapter_ch2",
+      "q1",
+      "q2",
+    ]);
+    expect(extractDeepReadPlanMetadata(sanitized)?.templateId).to.equal(
+      "custom",
+    );
+
+    const resumed = fillDeepReadSlot(
+      sanitized,
+      "chapter_ch2",
+      "Second chapter completed",
+      "第二章",
+    );
+    expect(resumed).to.include("Completed content");
+    expect(getDeepReadSlotStatus(resumed, "chapter_ch2")).to.equal("done");
+    expect(countCompletedDeepReadSlots(resumed)).to.equal(2);
+  });
+
+  it("migrates commentless residual notes without discarding completed prose", function () {
+    const template = v2Template();
+    const planned = planDeepReadSlots(template, DEFAULT_CHAPTER_FALLBACKS);
+    const skeleton = buildDeepReadSkeletonHtml("Paper", template, planned);
+    const legacy = [
+      "<h1>AI 精读 - Paper</h1>",
+      "<h2>引言</h2>",
+      "<p>Previously completed analysis.</p>",
+      "<hr/>",
+      "<h2>第二章</h2>",
+      "<p>⏳ 等待生成...</p>",
+      "<hr/>",
+      "<h2>贡献</h2>",
+      "<p>⏳ 等待生成...</p>",
+      "<hr/>",
+      "<h2>局限</h2>",
+      "<p>⏳ 等待生成...</p>",
+    ].join("\n");
+
+    const recovered = recoverDeepReadFromResidualHtml(
+      legacy,
+      skeleton,
+      planned,
+    );
+
+    expect(recovered).to.include("Previously completed analysis.");
+    expect(recovered).to.include("从旧笔记恢复的已完成内容");
+    expect(getDeepReadSlotStatus(recovered, "chapter_ch1")).to.equal("done");
+    expect(getDeepReadSlotStatus(recovered, "chapter_ch2")).to.equal("pending");
+    expect(countCompletedDeepReadSlots(recovered)).to.equal(1);
+  });
+
+  it("migrates commentless failed slots as unfinished work", function () {
+    const template = v2Template();
+    const planned = planDeepReadSlots(template, DEFAULT_CHAPTER_FALLBACKS);
+    const skeleton = buildDeepReadSkeletonHtml("Paper", template, planned);
+    const legacy = [
+      "<h1>AI 精读 - Paper</h1>",
+      "<h2>引言</h2>",
+      "<p>Previously completed analysis.</p>",
+      "<h2>第二章</h2>",
+      "<p>❌ upstream connection reset</p>",
+    ].join("\n");
+
+    const recovered = recoverDeepReadFromResidualHtml(
+      legacy,
+      skeleton,
+      planned,
+    );
+
+    expect(recovered).to.include("Previously completed analysis.");
+    expect(recovered).to.not.include("upstream connection reset");
+    expect(getDeepReadSlotStatus(recovered, "chapter_ch1")).to.equal("done");
+    expect(getDeepReadSlotStatus(recovered, "chapter_ch2")).to.equal("pending");
   });
 
   it("recovers chapters from rendered deep-read notes when metadata is missing", function () {
@@ -272,7 +376,7 @@ describe("multi-round prompt templates v2", function () {
     );
 
     expect(filled).to.not.include("<h2>引言</h2>");
-    expect(filled).to.include("<h2>第1章精读：Introduction</h2>");
+    expect(filled).to.match(/<h2>[\s\S]*?第1章精读：Introduction<\/h2>/);
   });
 
   it("keeps deep-read prose from becoming a top-level heading", function () {
@@ -288,9 +392,9 @@ describe("multi-round prompt templates v2", function () {
       "综述摘要精读",
     );
 
-    expect(filled).to.include("<h2>综述精读</h2>");
+    expect(filled).to.match(/<h2>[\s\S]*?综述精读<\/h2>/);
     expect(filled).to.include("<h3>论文概述与核心背景</h3>");
-    expect(filled).to.include(`<p>${prose}</p>`);
+    expect(filled).to.include(`<p>${prose}`);
     expect(filled).to.not.include(`<h1>${prose}</h1>`);
   });
 });

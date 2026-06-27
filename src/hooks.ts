@@ -556,11 +556,15 @@ function getRegenerationCounts(
     tableFill: 0,
   };
 
-  for (const itemPlan of plan.itemPlans) {
-    for (const type of itemPlan.types) {
-      if (!isRegeneratableDialogType(type)) continue;
-      counts[type] += 1;
-    }
+  const uniqueTasks = new Set<string>();
+  for (const note of plan.notes) {
+    if (!isRegeneratableDialogType(note.type)) continue;
+    const lang = note.type === "tableFill" ? "zh" : note.lang || "zh";
+    uniqueTasks.add(`${note.itemId}:${note.type}:${lang}`);
+  }
+  for (const task of uniqueTasks) {
+    const type = task.split(":")[1] as RegeneratableAiNoteType;
+    counts[type] += 1;
   }
 
   return counts;
@@ -571,6 +575,7 @@ function isRegeneratableDialogType(
 ): type is RegeneratableAiNoteType {
   return (
     type === "summary" ||
+    type === "deepRead" ||
     type === "imageSummary" ||
     type === "mindmap" ||
     type === "tableFill"
@@ -598,7 +603,8 @@ function formatPlanTypeCounts(plan: CollectionAiNoteCleanPlan): string {
 function formatRegenerationCounts(plan: CollectionAiNoteCleanPlan): string {
   const counts = getRegenerationCounts(plan);
   const parts = [
-    counts.summary > 0 ? `${counts.summary} 篇论文重新精读` : "",
+    counts.summary > 0 ? `${counts.summary} 个 AI 总结` : "",
+    counts.deepRead > 0 ? `${counts.deepRead} 个 AI 精读` : "",
     counts.imageSummary > 0 ? `${counts.imageSummary} 个一图总结` : "",
     counts.mindmap > 0 ? `${counts.mindmap} 个思维导图` : "",
     counts.tableFill > 0 ? `${counts.tableFill} 个填表任务` : "",

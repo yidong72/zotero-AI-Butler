@@ -21,7 +21,7 @@ import {
 import type { LLMAbortSignal, LLMResponse } from "./llmproviders/types";
 import { getPref } from "../utils/prefs";
 import { getDefaultMindmapPrompt, type PromptLang } from "../utils/prompts";
-import { ENGLISH_NOTE_TAG, isEnglishNote } from "./aiNoteClassifier";
+import { ENGLISH_NOTE_TAG, isEnglishNoteVariant } from "./aiNoteClassifier";
 
 /**
  * 工作流阶段类型
@@ -309,7 +309,7 @@ ${truncatedRequest}`;
       if (!isMindmap) continue;
 
       // 中英文版本按 ENGLISH_NOTE_TAG 区分，互不覆盖
-      if (isEnglishNote(tags) !== (lang === "en")) continue;
+      if (isEnglishNoteVariant(tags, noteHtml) !== (lang === "en")) continue;
 
       return note;
     }

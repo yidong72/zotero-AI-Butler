@@ -4,7 +4,7 @@
   LEGACY_SUMMARY_NOTE_TAG,
   SUMMARY_NOTE_TAG,
   isDeepReadNote,
-  isEnglishNote,
+  isEnglishNoteVariant,
   isFollowUpChatNote,
   isRegularSummaryNote,
   type NoteTag,
@@ -94,7 +94,7 @@ export class AiNoteService {
             : isDeepReadNote(tags, noteHtml);
         if (!matches) continue;
         // 中英文版本按 ENGLISH_NOTE_TAG 区分，避免互相覆盖。
-        if (isEnglishNote(tags) !== (lang === "en")) continue;
+        if (isEnglishNoteVariant(tags, noteHtml) !== (lang === "en")) continue;
 
         if (!target || compareModified(note, target) > 0) {
           target = note as Zotero.Item;

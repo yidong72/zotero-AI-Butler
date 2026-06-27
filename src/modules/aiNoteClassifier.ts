@@ -10,13 +10,16 @@ const CHAT_NOTE_TAG = "AI-Butler-Chat";
 const MINDMAP_NOTE_TAG = "AI-Mindmap";
 const IMAGE_NOTE_TAGS = ["AI-Image-Summary", "AI-ImageSummary"];
 
-const AI_BUTLER_SUMMARY_HEADING_RE = /<h2>\s*AI\s*管家\s*-\s*(?!后续追问)/;
+const AI_BUTLER_SUMMARY_HEADING_RE =
+  /<h2>\s*AI\s*(?:管家|Summary)\s*-\s*(?!后续追问)/i;
 const AI_BUTLER_DEEP_READ_HEADING_RE =
-  /<h[12]>\s*AI\s*(?:\u7cbe\u8bfb|\u7ba1\u5bb6\s*-\s*\u7cbe\u8bfb)\s*-/;
+  /<h[12]>\s*AI\s*(?:\u7cbe\u8bfb|\u7ba1\u5bb6\s*-\s*\u7cbe\u8bfb|Deep\s+Read)\s*-/i;
 const AI_BUTLER_CHAT_HEADING_RE =
   /<h2>\s*AI\s*管家\s*-\s*后续追问(?:\s*-|\s*笔记|[\s<])/;
-const AI_BUTLER_MINDMAP_HEADING_RE = /AI\s*管家思维导图\s*-/;
-const AI_BUTLER_IMAGE_HEADING_RE = /AI\s*管家一图总结\s*-/;
+const AI_BUTLER_MINDMAP_HEADING_RE = /AI\s*(?:管家思维导图|Mindmap)\s*-/i;
+const AI_BUTLER_IMAGE_HEADING_RE = /AI\s*(?:管家一图总结|Image\s+Summary)\s*-/i;
+const AI_BUTLER_ENGLISH_HEADING_RE =
+  /<h[12][^>]*>\s*AI\s*(?:Summary|Deep\s+Read|Image\s+Summary|Mindmap)\s*-/i;
 const AI_BUTLER_TABLE_HEADING_RE = /AI\s*管家.*(?:填表|表格)/;
 const AI_BUTLER_REVIEW_HEADING_RE = /AI\s*管家.*(?:文献综述|综述)/;
 
@@ -36,6 +39,14 @@ export function hasNoteTag(tags: NoteTag[], tag: string): boolean {
 /** 判断笔记是否为英文提示词入口生成（带 ENGLISH_NOTE_TAG 标签）。 */
 export function isEnglishNote(tags: NoteTag[]): boolean {
   return hasNoteTag(tags, ENGLISH_NOTE_TAG);
+}
+
+/** Recognize tagged English notes and older English notes created before tags were added. */
+export function isEnglishNoteVariant(
+  tags: NoteTag[],
+  noteHtml: string,
+): boolean {
+  return isEnglishNote(tags) || AI_BUTLER_ENGLISH_HEADING_RE.test(noteHtml);
 }
 
 export function isFollowUpChatNote(tags: NoteTag[], noteHtml: string): boolean {

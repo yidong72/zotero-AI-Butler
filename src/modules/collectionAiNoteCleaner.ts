@@ -1,9 +1,11 @@
 import {
   classifyAiButlerNote,
+  isEnglishNoteVariant,
   type AiButlerNoteType,
   type NoteTag,
 } from "./aiNoteClassifier";
 import { TaskQueueManager, type TaskType } from "./taskQueue";
+import type { PromptLang } from "../utils/prompts";
 
 export type CollectionAiNoteCleanScope = "summary" | "all";
 export type CollectionAiNoteCleanAction = "delete" | "deleteAndRegenerate";
@@ -21,6 +23,7 @@ export interface CollectionAiNoteRecord {
   itemId: number;
   itemTitle: string;
   type: CleanableAiNoteType;
+  lang: PromptLang;
 }
 
 export interface CollectionAiNoteItemPlan {
@@ -166,6 +169,7 @@ export class CollectionAiNoteCleaner {
           itemId: item.id,
           itemTitle,
           type: noteType,
+          lang: isEnglishNoteVariant(tags, noteHtml) ? "en" : "zh",
         });
         counts[noteType] += 1;
 
@@ -248,8 +252,15 @@ export class CollectionAiNoteCleaner {
 
         for (const type of itemPlan.types) {
           if (!isRegeneratableNoteType(type)) continue;
-          await this.enqueueRegeneration(manager, item, type);
-          queued[type] += 1;
+          const languages = this.getRegenerationLanguages(
+            plan,
+            itemPlan.itemId,
+            type,
+          );
+          for (const lang of languages) {
+            await this.enqueueRegeneration(manager, item, type, lang);
+            queued[type] += 1;
+          }
         }
       }
     }
@@ -294,30 +305,58 @@ export class CollectionAiNoteCleaner {
     manager: TaskQueueManager,
     item: Zotero.Item,
     type: RegeneratableAiNoteType,
+    lang: PromptLang,
   ): Promise<void> {
     switch (type) {
       case "summary":
-        await manager.addTask(item, false, {
-          summaryMode: "single",
-          forceOverwrite: true,
-        });
+        await manager.addTask(
+          item,
+          false,
+          {
+            summaryMode: "single",
+            forceOverwrite: true,
+          },
+          lang,
+        );
         break;
       case "deepRead":
-        await manager.addDeepReadTask(item, false, {
-          summaryMode: "deepRead",
-          forceOverwrite: true,
-        });
+        await manager.addDeepReadTask(
+          item,
+          false,
+          {
+            summaryMode: "deepRead",
+            forceOverwrite: true,
+          },
+          lang,
+        );
         break;
       case "imageSummary":
-        await manager.addImageSummaryTask(item, false);
+        await manager.addImageSummaryTask(item, false, lang);
         break;
       case "mindmap":
-        await manager.addMindmapTask(item, false);
+        await manager.addMindmapTask(item, false, lang);
         break;
       case "tableFill":
         await manager.addTableFillTask(item, false);
         break;
     }
+  }
+
+  private static getRegenerationLanguages(
+    plan: CollectionAiNoteCleanPlan,
+    itemId: number,
+    type: RegeneratableAiNoteType,
+  ): PromptLang[] {
+    // Table notes do not currently expose a bilingual entry point.
+    if (type === "tableFill") return ["zh"];
+
+    const languages = new Set<PromptLang>();
+    for (const note of plan.notes) {
+      if (note.itemId === itemId && note.type === type) {
+        languages.add(note.lang || "zh");
+      }
+    }
+    return languages.size > 0 ? Array.from(languages) : ["zh"];
   }
 
   private static sortTypes(

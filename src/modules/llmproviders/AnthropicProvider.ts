@@ -120,6 +120,7 @@ export class AnthropicProvider implements ILlmProvider {
     let processedLength = 0;
     let partialLine = "";
     let gotAnyDelta = false;
+    let streamComplete = false;
     let abortError: Error | null = null;
     let cleanupAbortSignal: (() => void) | undefined;
 
@@ -178,6 +179,7 @@ export class AnthropicProvider implements ILlmProvider {
                   if (!jsonStr) continue;
                   try {
                     const json = JSON.parse(jsonStr);
+                    if (json.type === "message_stop") streamComplete = true;
                     if (json.type === "content_block_delta") {
                       const text = json?.delta?.text;
                       if (text) {
@@ -207,9 +209,28 @@ export class AnthropicProvider implements ILlmProvider {
           };
         },
       });
+      const finalLine = partialLine.replace(/^data:\s*/, "").trim();
+      if (finalLine) {
+        try {
+          if (JSON.parse(finalLine)?.type === "message_stop") {
+            streamComplete = true;
+          }
+        } catch {
+          // The terminal event may already have been consumed on a prior line.
+        }
+      }
+      if (!streamComplete) {
+        throw new Error("Anthropic 流式连接提前结束，未收到 message_stop");
+      }
     } catch (error: any) {
-      if (abortError || isAbortError(error, options.abortSignal)) {
-        throw normalizeAbortError(abortError || error, options.abortSignal);
+      if (abortError) {
+        if (isAbortError(abortError, options.abortSignal)) {
+          throw normalizeAbortError(abortError, options.abortSignal);
+        }
+        throw abortError;
+      }
+      if (isAbortError(error, options.abortSignal)) {
+        throw normalizeAbortError(error, options.abortSignal);
       }
       let errorMessage = error?.message || "Anthropic 请求失败";
       try {
@@ -228,7 +249,6 @@ export class AnthropicProvider implements ILlmProvider {
       } catch {
         /* ignore */
       }
-      if (gotAnyDelta && chunks.length > 0) return chunks.join("");
       throw new Error(errorMessage);
     } finally {
       cleanupAbortSignal?.();
@@ -324,8 +344,44 @@ export class AnthropicProvider implements ILlmProvider {
     let processedLength = 0;
     let partialLine = "";
     let lastUsage: any;
+    let streamComplete = false;
+    let streamFailure = "";
+    let finishReason = "";
     let abortError: Error | null = null;
     let cleanupAbortSignal: (() => void) | undefined;
+    const consumeEvent = (json: any) => {
+      if (
+        options.enablePromptCache &&
+        json.type === "message_start" &&
+        json?.message?.usage
+      ) {
+        lastUsage = json.message.usage;
+      }
+      if (json.type === "message_stop") {
+        streamComplete = true;
+        return;
+      }
+      if (json.type === "message_delta" && json?.delta?.stop_reason) {
+        finishReason = String(json.delta.stop_reason);
+      }
+      if (json.type === "error") {
+        streamFailure =
+          json?.error?.message || json?.error?.type || "Anthropic 流式请求失败";
+        return;
+      }
+      if (json.type !== "content_block_delta") return;
+      const text = json?.delta?.text;
+      if (!text) return;
+      chunks.push(text);
+      const current = chunks.join("");
+      if (onProgress && current.length > delivered) {
+        const newChunk = current.slice(delivered);
+        delivered = current.length;
+        Promise.resolve(onProgress(newChunk)).catch((err) => {
+          ztoolkit.log("[AI-Butler] onProgress error:", err);
+        });
+      }
+    };
 
     try {
       await Zotero.HTTP.request("POST", endpoint, {
@@ -394,28 +450,7 @@ export class AnthropicProvider implements ILlmProvider {
                   if (!jsonStr) continue;
 
                   try {
-                    const json = JSON.parse(jsonStr);
-                    if (
-                      options.enablePromptCache &&
-                      json.type === "message_start" &&
-                      json?.message?.usage
-                    ) {
-                      lastUsage = json.message.usage;
-                    }
-                    if (json.type === "content_block_delta") {
-                      const text = json?.delta?.text;
-                      if (text) {
-                        chunks.push(text);
-                        const current = chunks.join("");
-                        if (onProgress && current.length > delivered) {
-                          const newChunk = current.slice(delivered);
-                          delivered = current.length;
-                          Promise.resolve(onProgress(newChunk)).catch((err) => {
-                            ztoolkit.log("[AI-Butler] onProgress error:", err);
-                          });
-                        }
-                      }
-                    }
+                    consumeEvent(JSON.parse(jsonStr));
                   } catch {
                     /* ignore */
                   }
@@ -427,9 +462,27 @@ export class AnthropicProvider implements ILlmProvider {
           };
         },
       });
+      const finalLine = partialLine.replace(/^data:\s*/, "").trim();
+      if (finalLine) {
+        try {
+          consumeEvent(JSON.parse(finalLine));
+        } catch {
+          // A terminal event may already have been consumed on the prior line.
+        }
+      }
+      if (streamFailure) throw new Error(streamFailure);
+      if (!streamComplete) {
+        throw new Error("Anthropic 流式连接提前结束，未收到 message_stop");
+      }
     } catch (error: any) {
-      if (abortError || isAbortError(error, options.abortSignal)) {
-        throw normalizeAbortError(abortError || error, options.abortSignal);
+      if (abortError) {
+        if (isAbortError(abortError, options.abortSignal)) {
+          throw normalizeAbortError(abortError, options.abortSignal);
+        }
+        throw abortError;
+      }
+      if (isAbortError(error, options.abortSignal)) {
+        throw normalizeAbortError(error, options.abortSignal);
       }
       let errorMessage = error?.message || "Anthropic 请求失败";
       try {
@@ -460,6 +513,12 @@ export class AnthropicProvider implements ILlmProvider {
 
     if (options.enablePromptCache) {
       logPromptCacheUsage("Anthropic chat", lastUsage);
+    }
+    if (finishReason) {
+      options.vendorOptions = {
+        ...(options.vendorOptions || {}),
+        responseFinishReason: finishReason,
+      };
     }
     return chunks.join("");
   }
@@ -717,6 +776,7 @@ export class AnthropicProvider implements ILlmProvider {
     let processedLength = 0;
     let partialLine = "";
     let gotAnyDelta = false;
+    let streamComplete = false;
     let abortError: Error | null = null;
     let cleanupAbortSignal: (() => void) | undefined;
 
@@ -775,6 +835,7 @@ export class AnthropicProvider implements ILlmProvider {
                   if (!jsonStr) continue;
                   try {
                     const json = JSON.parse(jsonStr);
+                    if (json.type === "message_stop") streamComplete = true;
                     if (json.type === "content_block_delta") {
                       const text = json?.delta?.text;
                       if (text) {
@@ -817,12 +878,24 @@ export class AnthropicProvider implements ILlmProvider {
           };
         },
       });
+      const finalLine = partialLine.replace(/^data:\s*/, "").trim();
+      if (finalLine) {
+        try {
+          if (JSON.parse(finalLine)?.type === "message_stop") {
+            streamComplete = true;
+          }
+        } catch {
+          // The terminal event may already have been consumed on a prior line.
+        }
+      }
+      if (!streamComplete) {
+        throw new Error("Anthropic 流式连接提前结束，未收到 message_stop");
+      }
     } catch (error: any) {
       if (abortError) {
         if (isAbortError(abortError, options.abortSignal)) {
           throw normalizeAbortError(abortError, options.abortSignal);
         }
-        if (gotAnyDelta && chunks.length > 0) return chunks.join("");
         throw abortError;
       }
       if (isAbortError(error, options.abortSignal)) {
@@ -845,7 +918,6 @@ export class AnthropicProvider implements ILlmProvider {
       } catch {
         /* ignore */
       }
-      if (gotAnyDelta && chunks.length > 0) return chunks.join("");
       throw new Error(errorMessage);
     } finally {
       cleanupAbortSignal?.();

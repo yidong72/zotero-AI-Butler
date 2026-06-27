@@ -4,9 +4,13 @@ import {
   TaskQueueManager,
   TaskStatus,
   getDeepReadTaskId,
+  getImageSummaryTaskId,
+  getMindmapTaskId,
   getSummaryTaskId,
+  inferTaskPromptLanguage,
   type TaskItem,
 } from "../src/modules/taskQueue";
+import type { PromptLang } from "../src/utils/prompts";
 import {
   TaskArtifacts,
   type TaskArtifactProbeResult,
@@ -23,12 +27,25 @@ type QueueInternals = {
     item: Zotero.Item,
     priority?: boolean,
     options?: { summaryMode?: string; forceOverwrite?: boolean },
+    lang?: PromptLang,
   ): Promise<string>;
   addDeepReadTask(
     item: Zotero.Item,
     priority?: boolean,
     options?: { summaryMode?: string; forceOverwrite?: boolean },
+    lang?: PromptLang,
   ): Promise<string>;
+  addImageSummaryTask(
+    item: Zotero.Item,
+    priority?: boolean,
+    lang?: PromptLang,
+  ): Promise<string>;
+  addMindmapTask(
+    item: Zotero.Item,
+    priority?: boolean,
+    lang?: PromptLang,
+  ): Promise<string>;
+  maybeAutoTriggerImageSummary(itemId: number, lang: PromptLang): Promise<void>;
   requeueExistingFixedTask(
     task: TaskItem,
     item: Zotero.Item,
@@ -130,6 +147,93 @@ describe("TaskQueue artifact-aware requeue", function () {
     expect(taskId).to.equal(getSummaryTaskId(item.id));
     expect(task?.taskType).to.equal("summary");
     expect(task?.options?.summaryMode).to.equal("single");
+  });
+
+  it("keeps Chinese and English summary tasks independent", async function () {
+    const manager = createQueueInternals();
+    stubProbe({ exists: false, reason: "summary-note-missing" });
+
+    const zhTaskId = await manager.addTask(item, false, undefined, "zh");
+    const enTaskId = await manager.addTask(item, false, undefined, "en");
+
+    expect(zhTaskId).to.equal(getSummaryTaskId(item.id, "zh"));
+    expect(enTaskId).to.equal(getSummaryTaskId(item.id, "en"));
+    expect(enTaskId).to.not.equal(zhTaskId);
+    expect(manager.tasks.get(zhTaskId)?.promptLanguage).to.equal("zh");
+    expect(manager.tasks.get(enTaskId)?.promptLanguage).to.equal("en");
+  });
+
+  it("preserves English on skipped completed task records", async function () {
+    const manager = createQueueInternals();
+    let probedLanguage: PromptLang | undefined;
+    TaskArtifacts.probe = async (_type, _item, lang) => {
+      probedLanguage = lang;
+      return { exists: true };
+    };
+
+    const taskId = await manager.addTask(item, false, undefined, "en");
+    const task = manager.tasks.get(taskId);
+
+    expect(taskId).to.equal(getSummaryTaskId(item.id, "en"));
+    expect(task?.status).to.equal(TaskStatus.COMPLETED);
+    expect(task?.promptLanguage).to.equal("en");
+    expect(probedLanguage).to.equal("en");
+  });
+
+  it("keeps bilingual image and mindmap tasks independent", async function () {
+    const manager = createQueueInternals();
+
+    const zhImageId = await manager.addImageSummaryTask(item, false, "zh");
+    const enImageId = await manager.addImageSummaryTask(item, false, "en");
+    const zhMindmapId = await manager.addMindmapTask(item, false, "zh");
+    const enMindmapId = await manager.addMindmapTask(item, false, "en");
+
+    expect(zhImageId).to.equal(getImageSummaryTaskId(item.id, "zh"));
+    expect(enImageId).to.equal(getImageSummaryTaskId(item.id, "en"));
+    expect(zhMindmapId).to.equal(getMindmapTaskId(item.id, "zh"));
+    expect(enMindmapId).to.equal(getMindmapTaskId(item.id, "en"));
+    expect(manager.tasks.get(enImageId)?.promptLanguage).to.equal("en");
+    expect(manager.tasks.get(enMindmapId)?.promptLanguage).to.equal("en");
+    expect(manager.tasks.get(enImageId)?.maxRetries).to.equal(2);
+  });
+
+  it("recovers English language from legacy persisted task IDs", function () {
+    expect(inferTaskPromptLanguage({ id: "summary-task-1-en" })).to.equal("en");
+    expect(inferTaskPromptLanguage({ id: "img-task-1-en" })).to.equal("en");
+    expect(
+      inferTaskPromptLanguage({
+        id: "summary-task-1-en",
+        promptLanguage: "zh",
+      }),
+    ).to.equal("en");
+    expect(inferTaskPromptLanguage({ id: "summary-task-1" })).to.equal("zh");
+  });
+
+  it("carries summary language into automatic image generation", async function () {
+    const manager = createQueueInternals();
+    const autoImagePref = `${config.prefsPrefix}.autoImageSummaryOnComplete`;
+    const originalAutoImage = Zotero.Prefs.get(autoImagePref, true);
+    const originalGetAsync = Zotero.Items.getAsync;
+    let captured: { priority?: boolean; lang?: PromptLang } | undefined;
+    Zotero.Prefs.set(autoImagePref, true, true);
+    Zotero.Items.getAsync = async () => item;
+    manager.addImageSummaryTask = async (_item, priority, lang) => {
+      captured = { priority, lang };
+      return getImageSummaryTaskId(item.id, lang);
+    };
+
+    try {
+      await manager.maybeAutoTriggerImageSummary(item.id, "en");
+    } finally {
+      Zotero.Items.getAsync = originalGetAsync;
+      if (originalAutoImage == null) {
+        Zotero.Prefs.clear(autoImagePref, true);
+      } else {
+        Zotero.Prefs.set(autoImagePref, originalAutoImage, true);
+      }
+    }
+
+    expect(captured).to.deep.equal({ priority: true, lang: "en" });
   });
 
   it("routes explicit deep-read mode away from normal summary tasks", async function () {
@@ -325,6 +429,8 @@ describe("TaskQueue artifact-aware requeue", function () {
     expect(getSummaryTaskId(1)).to.equal("summary-task-1");
     expect(getDeepReadTaskId(1)).to.equal("deepread-task-1");
     expect(getSummaryTaskId(1)).to.not.equal(getDeepReadTaskId(1));
+    expect(getSummaryTaskId(1, "en")).to.equal("summary-task-1-en");
+    expect(getDeepReadTaskId(1, "en")).to.equal("deepread-task-1-en");
   });
 
   it("treats deep-read notes with runnable slots as incomplete artifacts", async function () {

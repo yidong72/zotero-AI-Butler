@@ -8,6 +8,7 @@ import {
   type MultiRoundPromptPhase,
   type MultiRoundPromptTemplate,
   type MultiRoundSequentialDynamicPhase,
+  type PromptLang,
 } from "../utils/prompts";
 
 export type DeepReadSlot = {
@@ -34,6 +35,7 @@ export type DeepReadPlanMetadata = {
 };
 
 export const DEEP_READ_SLOT_PREFIX = "zab:slot";
+const DEEP_READ_DURABLE_SLOT_PREFIX = "zab://slot/";
 
 /**
  * 精读 slot 占位符（“⏳ 等待生成...”/“🔄 正在生成...”）的专用匹配。
@@ -43,7 +45,10 @@ export const DEEP_READ_SLOT_PREFIX = "zab:slot";
  * 若用裸词匹配会把已正确生成的笔记误判为损坏，导致反复重生的死循环。
  */
 const DEEP_READ_PLACEHOLDER_RE = /(?:⏳|🔄)️?\s*(?:等待生成|正在生成)/;
+const DEEP_READ_LEGACY_INCOMPLETE_RE =
+  /(?:⏳|🔄)️?\s*(?:等待生成|正在生成)|<p[^>]*>\s*❌|已取消，重新运行\s*AI\s*精读时会从这里继续/;
 export const DEEP_READ_PLAN_META_PREFIX = "zab:deep-read-plan";
+const DEEP_READ_DURABLE_PLAN_PREFIX = "zab://plan/";
 
 export function planDeepReadSlots(
   template: MultiRoundPromptTemplate,
@@ -74,12 +79,18 @@ export function buildDeepReadSkeletonHtml(
   itemTitle: string,
   template: MultiRoundPromptTemplate,
   planned: PlannedDeepRead,
+  lang: PromptLang = "zh",
 ): string {
+  const noteTitle = lang === "en" ? "AI Deep Read" : "AI 精读";
+  const chapterHeading = lang === "en" ? "Chapter Structure" : "章节解析";
   const parts: string[] = [
     buildPlanMetadataComment(template, planned.chapters),
-    `<h1>AI 精读 - ${escapeHtml(truncateTitle(itemTitle))}</h1>`,
-    `<h2>章节解析</h2>`,
-    ...buildChapterListHtml(planned.chapters),
+    `<h1>${noteTitle} - ${escapeHtml(truncateTitle(itemTitle))}${buildDurablePlanMarker(
+      template,
+      planned.chapters,
+    )}</h1>`,
+    `<h2>${chapterHeading}</h2>`,
+    ...buildChapterListHtml(planned.chapters, lang),
   ];
 
   for (const phase of template.phases) {
@@ -113,7 +124,12 @@ export function fillDeepReadSlot(
     status === "done"
       ? `${headingHtml}${markdownToDeepReadSlotHtml(markdown)}`
       : `${headingHtml}<p>❌ ${escapeHtml(markdown)}</p>`;
-  return replaceDeepReadSlotHtml(noteHtml, slotId, htmlContent, status);
+  return replaceDeepReadSlotHtml(
+    noteHtml,
+    slotId,
+    addDurableSlotMarkers(htmlContent, slotId, status),
+    status,
+  );
 }
 
 function markdownToDeepReadSlotHtml(markdown: string): string {
@@ -173,13 +189,18 @@ export function replaceDeepReadSlotHtml(
   const pattern = new RegExp(
     `<!-- ${DEEP_READ_SLOT_PREFIX}:${escapeRegExp(slotId)}:(?:pending|running|done|error) -->[\\s\\S]*?<!-- ${DEEP_READ_SLOT_PREFIX}:${escapeRegExp(slotId)}:end -->`,
   );
-  if (!pattern.test(noteHtml)) {
-    return noteHtml;
+  if (pattern.test(noteHtml)) {
+    return noteHtml.replace(
+      pattern,
+      `<!-- ${DEEP_READ_SLOT_PREFIX}:${slotId}:${status} -->\n${innerHtml}\n<!-- ${DEEP_READ_SLOT_PREFIX}:${slotId}:end -->`,
+    );
   }
-  return noteHtml.replace(
-    pattern,
-    `<!-- ${DEEP_READ_SLOT_PREFIX}:${slotId}:${status} -->\n${innerHtml}\n<!-- ${DEEP_READ_SLOT_PREFIX}:${slotId}:end -->`,
-  );
+
+  const durableRange = findDurableSlotRange(noteHtml, slotId);
+  if (!durableRange) return noteHtml;
+  return `${noteHtml.slice(0, durableRange.start)}${innerHtml}${noteHtml.slice(
+    durableRange.end,
+  )}`;
 }
 
 export function getDeepReadSlotStatus(
@@ -191,7 +212,10 @@ export function getDeepReadSlotStatus(
       `<!-- ${DEEP_READ_SLOT_PREFIX}:${escapeRegExp(slotId)}:(pending|running|done|error) -->`,
     ),
   );
-  return (match?.[1] as DeepReadSlotStatus | undefined) || null;
+  if (match?.[1]) return match[1] as DeepReadSlotStatus;
+
+  const durable = noteHtml.match(buildDurableSlotMarkerRegex(slotId, "start"));
+  return (durable?.[1] as DeepReadSlotStatus | undefined) || null;
 }
 
 /** 提取某个 slot 起止标记之间的正文（含 HTML）；找不到返回 null。 */
@@ -204,7 +228,10 @@ export function getDeepReadSlotBody(
       `<!-- ${DEEP_READ_SLOT_PREFIX}:${escapeRegExp(slotId)}:(?:pending|running|done|error) -->([\\s\\S]*?)<!-- ${DEEP_READ_SLOT_PREFIX}:${escapeRegExp(slotId)}:end -->`,
     ),
   );
-  return match ? match[1] : null;
+  if (match) return match[1];
+
+  const range = findDurableSlotRange(noteHtml, slotId);
+  return range ? noteHtml.slice(range.start, range.end) : null;
 }
 
 /**
@@ -212,8 +239,14 @@ export function getDeepReadSlotBody(
  * 用于识别“标记为 done 但内容并未真正生成”的损坏 slot，使其能被重新生成。
  */
 export function isDeepReadSlotBodyPlaceholder(body: string | null): boolean {
-  if (body == null) return false;
-  return DEEP_READ_PLACEHOLDER_RE.test(body);
+  if (body == null) return true;
+  if (DEEP_READ_PLACEHOLDER_RE.test(body)) return true;
+  const contentText = body
+    .replace(/<a\b[^>]*href=["']zab:\/\/slot\/[\s\S]*?<\/a>/gi, "")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;|&#8203;/g, "")
+    .replace(/[\u200B-\u200D\uFEFF\s]/g, "");
+  return contentText.length === 0;
 }
 
 export function shouldRunDeepReadSlot(
@@ -236,11 +269,36 @@ export function isDeepReadSlotDone(noteHtml: string, slotId: string): boolean {
 }
 
 export function hasDeepReadV2Slots(noteHtml: string): boolean {
-  return noteHtml.includes(`<!-- ${DEEP_READ_SLOT_PREFIX}:`);
+  return (
+    noteHtml.includes(`<!-- ${DEEP_READ_SLOT_PREFIX}:`) ||
+    noteHtml.includes(DEEP_READ_DURABLE_SLOT_PREFIX)
+  );
 }
 
 export function hasRunnableDeepReadSlots(noteHtml: string): boolean {
   return extractRunnableDeepReadSlotIds(noteHtml).length > 0;
+}
+
+export function countCompletedDeepReadSlots(noteHtml: string): number {
+  const ids = new Set<string>();
+  const commentPattern =
+    /<!-- zab:slot:([^:]+):done -->([\s\S]*?)<!-- zab:slot:\1:end -->/g;
+  let match: RegExpExecArray | null;
+  while ((match = commentPattern.exec(noteHtml))) {
+    if (!isDeepReadSlotBodyPlaceholder(match[2])) ids.add(match[1]);
+  }
+
+  const durablePattern = new RegExp(
+    `${escapeRegExp(DEEP_READ_DURABLE_SLOT_PREFIX)}([^/"']+)/done/start`,
+    "g",
+  );
+  while ((match = durablePattern.exec(noteHtml))) {
+    const slotId = safeDecodeURIComponent(match[1]);
+    if (!isDeepReadSlotBodyPlaceholder(getDeepReadSlotBody(noteHtml, slotId))) {
+      ids.add(slotId);
+    }
+  }
+  return ids.size;
 }
 
 /**
@@ -251,7 +309,7 @@ export function hasRunnableDeepReadSlots(noteHtml: string): boolean {
  * 这种“标记丢失但有占位符”的损坏笔记需要整体重新生成。
  */
 export function noteHasDeepReadPlaceholderText(noteHtml: string): boolean {
-  return DEEP_READ_PLACEHOLDER_RE.test(noteHtml);
+  return DEEP_READ_LEGACY_INCOMPLETE_RE.test(noteHtml);
 }
 
 /**
@@ -259,17 +317,32 @@ export function noteHasDeepReadPlaceholderText(noteHtml: string): boolean {
  * 以及“标记为 done 但正文仍是占位符”的损坏 slot。
  */
 export function extractRunnableDeepReadSlotIds(noteHtml: string): string[] {
-  const ids: string[] = [];
+  const ids = new Set<string>();
   const pattern =
     /<!-- zab:slot:([^:]+):(pending|running|done|error) -->([\s\S]*?)<!-- zab:slot:\1:end -->/g;
   let match: RegExpExecArray | null;
   while ((match = pattern.exec(noteHtml))) {
     const [, slotId, status, body] = match;
     if (status !== "done" || isDeepReadSlotBodyPlaceholder(body)) {
-      ids.push(slotId);
+      ids.add(slotId);
     }
   }
-  return ids;
+
+  const durablePattern = new RegExp(
+    `${escapeRegExp(DEEP_READ_DURABLE_SLOT_PREFIX)}([^/"']+)/(pending|running|done|error)/start`,
+    "g",
+  );
+  while ((match = durablePattern.exec(noteHtml))) {
+    const slotId = safeDecodeURIComponent(match[1]);
+    const status = match[2] as DeepReadSlotStatus;
+    if (
+      status !== "done" ||
+      isDeepReadSlotBodyPlaceholder(getDeepReadSlotBody(noteHtml, slotId))
+    ) {
+      ids.add(slotId);
+    }
+  }
+  return [...ids];
 }
 
 export function markDeepReadSlotRunning(
@@ -280,28 +353,54 @@ export function markDeepReadSlotRunning(
   return replaceDeepReadSlotHtml(
     noteHtml,
     slotId,
-    `<h2>${escapeHtml(slotTitle || "")}</h2>\n<p>🔄 正在生成...</p>`,
+    addDurableSlotMarkers(
+      `<h2>${escapeHtml(slotTitle || "")}</h2>\n<p>🔄 正在生成...</p>`,
+      slotId,
+      "running",
+    ),
     "running",
   );
 }
 
 export function resetRunningDeepReadSlots(noteHtml: string): string {
-  return noteHtml.replace(
+  let nextHtml = noteHtml.replace(
     /<!-- zab:slot:([^:]+):running -->[\s\S]*?<!-- zab:slot:\1:end -->/g,
     (_match, slotId: string) =>
-      `<!-- ${DEEP_READ_SLOT_PREFIX}:${slotId}:pending -->\n<p>已取消，重新运行 AI 精读时会从这里继续。</p>\n<!-- ${DEEP_READ_SLOT_PREFIX}:${slotId}:end -->`,
+      `<!-- ${DEEP_READ_SLOT_PREFIX}:${slotId}:pending -->\n${addDurableSlotMarkers(
+        "<p>已取消，重新运行 AI 精读时会从这里继续。</p>",
+        slotId,
+        "pending",
+      )}\n<!-- ${DEEP_READ_SLOT_PREFIX}:${slotId}:end -->`,
   );
+  const runningIds = extractDurableSlotIdsByStatus(nextHtml, "running");
+  for (const slotId of runningIds) {
+    nextHtml = replaceDeepReadSlotHtml(
+      nextHtml,
+      slotId,
+      addDurableSlotMarkers(
+        "<p>已取消，重新运行 AI 精读时会从这里继续。</p>",
+        slotId,
+        "pending",
+      ),
+      "pending",
+    );
+  }
+  return nextHtml;
 }
 
 export function extractDeepReadPlanMetadata(
   noteHtml: string,
 ): DeepReadPlanMetadata | null {
-  const match = noteHtml.match(
+  const commentMatch = noteHtml.match(
     new RegExp(`<!-- ${DEEP_READ_PLAN_META_PREFIX}:([\\s\\S]*?) -->`),
   );
-  if (!match?.[1]) return null;
+  const durableMatch = noteHtml.match(
+    new RegExp(`${escapeRegExp(DEEP_READ_DURABLE_PLAN_PREFIX)}([^"']+)`),
+  );
+  const encoded = commentMatch?.[1] || durableMatch?.[1];
+  if (!encoded) return null;
   try {
-    const parsed = JSON.parse(decodeURIComponent(match[1]));
+    const parsed = JSON.parse(decodeURIComponent(encoded));
     if (!parsed || !Array.isArray(parsed.chapters)) return null;
     return {
       templateId:
@@ -312,6 +411,78 @@ export function extractDeepReadPlanMetadata(
   } catch {
     return null;
   }
+}
+
+/**
+ * Migrate a partial note whose HTML comments were removed by Zotero. Completed
+ * prose is retained verbatim, while durable link markers are created for the
+ * unfinished slots so subsequent runs can resume normally.
+ */
+export function recoverDeepReadFromResidualHtml(
+  existingHtml: string,
+  skeletonHtml: string,
+  planned: PlannedDeepRead,
+): string {
+  const placeholders = [
+    ...existingHtml.matchAll(new RegExp(DEEP_READ_LEGACY_INCOMPLETE_RE, "g")),
+  ];
+  if (!placeholders.length) return skeletonHtml;
+
+  const firstPlaceholderIndex = placeholders[0].index || 0;
+  const headingMatches = [
+    ...existingHtml
+      .slice(0, firstPlaceholderIndex)
+      .matchAll(/<h[1-6][^>]*>([\s\S]*?)<\/h[1-6]>/gi),
+  ];
+  const pendingTitle = normalizeRenderedText(
+    headingMatches[headingMatches.length - 1]?.[1] || "",
+  );
+  let firstIncompleteIndex = planned.slots.findIndex(
+    (slot) => normalizeRenderedText(slot.title) === pendingTitle,
+  );
+  if (firstIncompleteIndex < 0) {
+    firstIncompleteIndex = Math.max(
+      0,
+      planned.slots.length - placeholders.length,
+    );
+  }
+
+  let recoveredSkeleton = skeletonHtml;
+  for (let index = 0; index < firstIncompleteIndex; index++) {
+    const slot = planned.slots[index];
+    recoveredSkeleton = fillDeepReadSlot(
+      recoveredSkeleton,
+      slot.id,
+      "本轮已从旧版精读笔记恢复，原始内容完整保留在下方。",
+      slot.title,
+      "done",
+    );
+  }
+
+  const cleanedExisting = existingHtml
+    .replace(/<!--\s*zab:(?:slot|deep-read-plan):[\s\S]*?-->/g, "")
+    .replace(/<h1[^>]*>\s*AI\s*(?:精读|Deep Read)[\s\S]*?<\/h1>/i, "")
+    .replace(
+      /<h([1-6])[^>]*>(?:(?!<\/h\1>)[\s\S])*?<\/h\1>\s*<p[^>]*>\s*(?:⏳|🔄)️?\s*(?:等待生成|正在生成)\s*\.{0,3}\s*<\/p>/gi,
+      "",
+    )
+    .replace(
+      /<p[^>]*>\s*(?:⏳|🔄)️?\s*(?:等待生成|正在生成)\s*\.{0,3}\s*<\/p>/gi,
+      "",
+    )
+    .replace(
+      /<h([1-6])[^>]*>(?:(?!<\/h\1>)[\s\S])*?<\/h\1>\s*<p[^>]*>\s*❌[\s\S]*?<\/p>/gi,
+      "",
+    )
+    .replace(/<p[^>]*>\s*❌[\s\S]*?<\/p>/gi, "")
+    .replace(
+      /<p[^>]*>\s*已取消，重新运行\s*AI\s*精读时会从这里继续。?\s*<\/p>/gi,
+      "",
+    )
+    .trim();
+
+  if (!cleanedExisting) return recoveredSkeleton;
+  return `${recoveredSkeleton}\n<hr/>\n<h2>从旧笔记恢复的已完成内容</h2>\n${cleanedExisting}`;
 }
 
 export function extractDeepReadChaptersFromHtml(
@@ -374,6 +545,16 @@ function buildPlanMetadataComment(
   )} -->`;
 }
 
+function buildDurablePlanMarker(
+  template: MultiRoundPromptTemplate,
+  chapters: ChapterInfo[],
+): string {
+  const encoded = encodeURIComponent(
+    JSON.stringify({ templateId: template.id, template, chapters }),
+  );
+  return `<a href="${DEEP_READ_DURABLE_PLAN_PREFIX}${encoded}">&#8203;</a>`;
+}
+
 function validatePlannedSlotIds(slots: DeepReadSlot[]): void {
   const seen = new Set<string>();
   for (const slot of slots) {
@@ -433,32 +614,160 @@ function normalizeDeepReadPromptTitle(title: string): string {
 }
 
 function buildPendingSlotHtml(slot: DeepReadSlot): string {
+  const content = addDurableSlotMarkers(
+    `<h2>${escapeHtml(slot.title)}</h2>\n<p>⏳ 等待生成...</p>`,
+    slot.id,
+    "pending",
+  );
   return [
     `<!-- ${DEEP_READ_SLOT_PREFIX}:${slot.id}:pending -->`,
-    `<h2>${escapeHtml(slot.title)}</h2>`,
-    `<p>⏳ 等待生成...</p>`,
+    content,
     `<!-- ${DEEP_READ_SLOT_PREFIX}:${slot.id}:end -->`,
   ].join("\n");
 }
 
-function buildChapterListHtml(chapters: ChapterInfo[]): string[] {
+function addDurableSlotMarkers(
+  html: string,
+  slotId: string,
+  status: DeepReadSlotStatus,
+): string {
+  const startMarker = buildDurableSlotMarker(slotId, status, "start");
+  const endMarker = buildDurableSlotMarker(slotId, status, "end");
+  let marked = html.replace(/(<(?:h[1-6]|p)\b[^>]*>)/i, `$1${startMarker}`);
+  if (marked === html) marked = `<p>${startMarker}</p>${html}`;
+
+  const closingPattern =
+    /<\/(?:h[1-6]|p|li|ul|ol|blockquote|pre|td|th|table)>/gi;
+  const closings = [...marked.matchAll(closingPattern)];
+  const last = closings[closings.length - 1];
+  if (!last || last.index === undefined) return `${marked}<p>${endMarker}</p>`;
+  return `${marked.slice(0, last.index)}${endMarker}${marked.slice(last.index)}`;
+}
+
+function buildDurableSlotMarker(
+  slotId: string,
+  status: DeepReadSlotStatus,
+  boundary: "start" | "end",
+): string {
+  return `<a href="${DEEP_READ_DURABLE_SLOT_PREFIX}${encodeURIComponent(
+    slotId,
+  )}/${status}/${boundary}">&#8203;</a>`;
+}
+
+function buildDurableSlotMarkerRegex(
+  slotId: string,
+  boundary: "start" | "end",
+): RegExp {
+  return new RegExp(
+    `<a\\b[^>]*href=["']${escapeRegExp(
+      `${DEEP_READ_DURABLE_SLOT_PREFIX}${encodeURIComponent(slotId)}/`,
+    )}(pending|running|done|error)/${boundary}["'][^>]*>[\\s\\S]*?<\\/a>`,
+    "i",
+  );
+}
+
+function findDurableSlotRange(
+  noteHtml: string,
+  slotId: string,
+): { start: number; end: number } | null {
+  const startMatch = buildDurableSlotMarkerRegex(slotId, "start").exec(
+    noteHtml,
+  );
+  if (!startMatch || startMatch.index === undefined) return null;
+  const endPattern = buildDurableSlotMarkerRegex(slotId, "end");
+  const remainder = noteHtml.slice(startMatch.index + startMatch[0].length);
+  const endMatch = endPattern.exec(remainder);
+  if (!endMatch || endMatch.index === undefined) return null;
+
+  const beforeStart = noteHtml.slice(0, startMatch.index);
+  const openingBlocks = [
+    ...beforeStart.matchAll(
+      /<(?:h[1-6]|p|div|li|blockquote|pre|ul|ol|table)\b[^>]*>/gi,
+    ),
+  ];
+  const opening = openingBlocks[openingBlocks.length - 1];
+  const start = opening?.index ?? startMatch.index;
+  const markerEnd =
+    startMatch.index +
+    startMatch[0].length +
+    endMatch.index +
+    endMatch[0].length;
+  const closing = noteHtml
+    .slice(markerEnd)
+    .match(/<\/(?:h[1-6]|p|div|li|blockquote|pre|td|th|ul|ol|table)>/i);
+  const end =
+    closing?.index === undefined
+      ? markerEnd
+      : markerEnd + closing.index + closing[0].length;
+  return { start, end };
+}
+
+function extractDurableSlotIdsByStatus(
+  noteHtml: string,
+  status: DeepReadSlotStatus,
+): string[] {
+  const ids: string[] = [];
+  const pattern = new RegExp(
+    `${escapeRegExp(DEEP_READ_DURABLE_SLOT_PREFIX)}([^/"']+)/${status}/start`,
+    "g",
+  );
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(noteHtml))) {
+    ids.push(safeDecodeURIComponent(match[1]));
+  }
+  return ids;
+}
+
+function normalizeRenderedText(html: string): string {
+  return decodeBasicHtmlEntities(stripHtml(html))
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+    .replace(/\s+/g, "")
+    .trim();
+}
+
+function safeDecodeURIComponent(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function buildChapterListHtml(
+  chapters: ChapterInfo[],
+  lang: PromptLang = "zh",
+): string[] {
   if (!chapters.length) {
-    return ["<p>未识别到章节结构。</p>"];
+    return [
+      lang === "en"
+        ? "<p>No chapter structure was identified.</p>"
+        : "<p>未识别到章节结构。</p>",
+    ];
   }
 
   return chapters.map((chapter, index) => {
-    const title = formatChapterTitle(chapter);
-    return `<p>第${index + 1}章：${escapeHtml(title)}</p>`;
+    const title = formatChapterTitle(chapter, lang);
+    return lang === "en"
+      ? `<p>Chapter ${index + 1}: ${escapeHtml(title)}</p>`
+      : `<p>第${index + 1}章：${escapeHtml(title)}</p>`;
   });
 }
 
-function formatChapterTitle(chapter: ChapterInfo): string {
+function formatChapterTitle(
+  chapter: ChapterInfo,
+  lang: PromptLang = "zh",
+): string {
   const titleZh = chapter.title_zh.trim();
   const titleEn = chapter.title_en.trim();
   if (titleZh && titleEn && titleZh !== titleEn) {
-    return `${titleZh}（${titleEn}）`;
+    return lang === "en"
+      ? `${titleEn} (${titleZh})`
+      : `${titleZh}（${titleEn}）`;
   }
-  return titleZh || titleEn || "未命名章节";
+  return (
+    (lang === "en" ? titleEn || titleZh : titleZh || titleEn) ||
+    (lang === "en" ? "Untitled chapter" : "未命名章节")
+  );
 }
 
 function truncateTitle(title: string): string {

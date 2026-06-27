@@ -71,9 +71,9 @@ import {
   hasDeepReadV2Slots,
   hasRunnableDeepReadSlots,
   noteHasDeepReadPlaceholderText,
-  isDeepReadSlotDone,
   markDeepReadSlotRunning,
   planDeepReadSlots,
+  recoverDeepReadFromResidualHtml,
   resetRunningDeepReadSlots,
   shouldRunDeepReadSlot,
   type DeepReadSlot,
@@ -170,17 +170,15 @@ export class NoteGenerator {
       const useMultiModelSummary =
         summaryMode === "single" && multiModelEndpoints.length > 0;
       const noteKind: AiNoteKind =
-        summaryMode === "single" && !useMultiModelSummary
-          ? "summary"
-          : "deepRead";
+        summaryMode === "single" ? "summary" : "deepRead";
       const promptLanguage: PromptLang = options?.promptLanguage || "zh";
       const existingRecord = await AiNoteService.findNoteRecord(
         item,
         noteKind,
         promptLanguage,
       );
-      let existing = existingRecord?.note || null;
-      let deepReadExistingHtml = existingRecord?.rawHtml || "";
+      const existing = existingRecord?.note || null;
+      const deepReadExistingHtml = existingRecord?.rawHtml || "";
       const canResumeDeepRead =
         noteKind === "deepRead" &&
         !!existingRecord?.rawHtml &&
@@ -211,20 +209,12 @@ export class NoteGenerator {
         }
       }
 
-      // 损坏且无法续跑的 AI 精读笔记：直接删除旧笔记，按全新流程重建一份。
-      // 覆盖已被 Zotero 清洗过的旧笔记往往无法恢复（标记已丢失），而全新创建的
-      // 笔记与正常首次生成行为一致，可避免“占位符残留→反复重排队”的死循环。
+      // 旧版笔记可能只丢失注释标记而保留了已完成正文。不要删除它；精读引擎会
+      // 将正文迁移到带持久标记的新骨架，并只补跑占位符对应的未完成轮次。
       if (deepReadHasResidualPlaceholder && existing) {
-        try {
-          await (existing as any).eraseTx?.();
-          ztoolkit.log(
-            "[AI-Butler] 删除损坏的 AI 精读笔记，按全新流程重新生成",
-          );
-        } catch (e) {
-          ztoolkit.log("[AI-Butler] 删除损坏 AI 精读笔记失败:", e);
-        }
-        existing = null;
-        deepReadExistingHtml = "";
+        ztoolkit.log(
+          "[AI-Butler] 检测到旧版精读标记丢失，将保留已完成正文并迁移续跑",
+        );
       }
 
       // Step 1: PDF processing
@@ -343,6 +333,7 @@ export class NoteGenerator {
           progressCallback,
           streamCallback,
           abortSignal: options?.abortSignal,
+          promptLanguage,
         });
         fullContent = multiModelResult.content;
         noteContentOverride = multiModelResult.noteHtml;
@@ -578,6 +569,7 @@ export class NoteGenerator {
     progressCallback?: (message: string, progress: number) => void;
     streamCallback?: (chunk: string) => void;
     abortSignal?: LLMAbortSignal;
+    promptLanguage: PromptLang;
   }): Promise<{ content: string; noteHtml: string }> {
     const {
       item,
@@ -592,14 +584,23 @@ export class NoteGenerator {
       progressCallback,
       streamCallback,
       abortSignal,
+      promptLanguage,
     } = params;
+    const isEnglish = promptLanguage === "en";
     const total = endpoints.length;
     let completed = 0;
 
-    progressCallback?.(`正在使用 ${total} 个模型同时总结...`, 42);
+    progressCallback?.(
+      isEnglish
+        ? `Summarizing with ${total} models...`
+        : `正在使用 ${total} 个模型同时总结...`,
+      42,
+    );
     if (outputWindow) {
       outputWindow.showLoadingState(
-        `正在使用 ${total} 个模型分析「${itemTitle}」`,
+        isEnglish
+          ? `Analyzing "${itemTitle}" with ${total} models`
+          : `正在使用 ${total} 个模型分析「${itemTitle}」`,
       );
     }
 
@@ -615,10 +616,13 @@ export class NoteGenerator {
           pdfAttachmentMode,
           prefMode,
           abortSignal,
+          promptLanguage,
         });
         completed++;
         progressCallback?.(
-          `模型总结完成：${endpoint.name} (${completed}/${total})`,
+          isEnglish
+            ? `Model complete: ${endpoint.name} (${completed}/${total})`
+            : `模型总结完成：${endpoint.name} (${completed}/${total})`,
           42 + Math.floor((completed / total) * 36),
         );
         return result;
@@ -631,7 +635,9 @@ export class NoteGenerator {
           normalized,
         );
         progressCallback?.(
-          `模型总结失败：${endpoint.name} (${completed}/${total})`,
+          isEnglish
+            ? `Model failed: ${endpoint.name} (${completed}/${total})`
+            : `模型总结失败：${endpoint.name} (${completed}/${total})`,
           42 + Math.floor((completed / total) * 36),
         );
         return { endpoint, error: normalized };
@@ -655,7 +661,11 @@ export class NoteGenerator {
       const details = failures
         .map((failure) => `${failure.endpoint.name}: ${failure.error.message}`)
         .join("\n");
-      const error = new Error(`多模型同时总结全部失败。\n${details}`);
+      const error = new Error(
+        isEnglish
+          ? `All models failed during multi-model summary.\n${details}`
+          : `多模型同时总结全部失败。\n${details}`,
+      );
       const suppressAll =
         failures.length > 0 &&
         failures.every(
@@ -671,13 +681,17 @@ export class NoteGenerator {
     }
 
     const content = successes
-      .map((result) => this.formatMultiModelDisplayMarkdown(result))
+      .map((result) =>
+        this.formatMultiModelDisplayMarkdown(result, promptLanguage),
+      )
       .join("\n\n---\n\n");
     const noteHtml = successes
       .map((result) => result.noteHtml)
       .join("\n<hr/>\n");
     const displayContent = [
-      `**多模型同时总结完成：${successes.length}/${total} 个模型成功**`,
+      isEnglish
+        ? `**Multi-model summary complete: ${successes.length}/${total} models succeeded**`
+        : `**多模型同时总结完成：${successes.length}/${total} 个模型成功**`,
       "",
       content,
       failures.length > 0
@@ -685,7 +699,7 @@ export class NoteGenerator {
             "",
             "---",
             "",
-            "## 失败的供应商",
+            isEnglish ? "## Failed providers" : "## 失败的供应商",
             "",
             ...failures.map(
               (failure) =>
@@ -710,8 +724,12 @@ export class NoteGenerator {
 
     progressCallback?.(
       failures.length > 0
-        ? `多模型总结完成：${successes.length} 个成功，${failures.length} 个失败`
-        : "多模型总结完成",
+        ? isEnglish
+          ? `Multi-model summary complete: ${successes.length} succeeded, ${failures.length} failed`
+          : `多模型总结完成：${successes.length} 个成功，${failures.length} 个失败`
+        : isEnglish
+          ? "Multi-model summary complete"
+          : "多模型总结完成",
       80,
     );
 
@@ -728,6 +746,7 @@ export class NoteGenerator {
     pdfAttachmentMode: string;
     prefMode: string;
     abortSignal?: LLMAbortSignal;
+    promptLanguage: PromptLang;
   }): Promise<MultiModelSummaryResult> {
     const {
       item,
@@ -739,6 +758,7 @@ export class NoteGenerator {
       pdfAttachmentMode,
       prefMode,
       abortSignal,
+      promptLanguage,
     } = params;
 
     if (summaryMode !== "single") {
@@ -755,6 +775,8 @@ export class NoteGenerator {
     );
     const response = await LLMService.generateWithEndpoint(endpoint.id, {
       task: "summary",
+      prompt:
+        promptLanguage === "en" ? getDefaultSummaryPrompt("en") : undefined,
       content: {
         kind: "zotero-item",
         item,
@@ -772,7 +794,7 @@ export class NoteGenerator {
     const noteHtml = this.formatNoteContent(
       itemTitle,
       content,
-      "AI 管家",
+      AiNoteService.getTitle("summary", promptLanguage),
       metadata,
     );
 
@@ -798,12 +820,15 @@ export class NoteGenerator {
 
   private static formatMultiModelDisplayMarkdown(
     result: MultiModelSummaryResult,
+    lang: PromptLang = "zh",
   ): string {
     const model = result.response.model || result.endpoint.model || "(unknown)";
     return [
       `## ${result.endpoint.name}`,
       "",
-      `供应商: ${result.endpoint.name}  模型: ${model}`,
+      lang === "en"
+        ? `Provider: ${result.endpoint.name}  Model: ${model}`
+        : `供应商: ${result.endpoint.name}  模型: ${model}`,
       "",
       result.content,
     ].join("\n");
@@ -1080,6 +1105,10 @@ export class NoteGenerator {
       params.existing &&
       hasDeepReadV2Slots(params.existingHtml) &&
       hasRunnableDeepReadSlots(params.existingHtml);
+    const shouldRecoverResidual =
+      !!params.existing &&
+      !hasDeepReadV2Slots(params.existingHtml) &&
+      noteHasDeepReadPlaceholderText(params.existingHtml);
     const restoredPlan = shouldResume
       ? extractDeepReadPlanMetadata(params.existingHtml)
       : null;
@@ -1126,7 +1155,7 @@ export class NoteGenerator {
     let lastResponse: LLMResponse | undefined;
     let chapters =
       restoredPlan?.chapters ||
-      (shouldResume
+      (shouldResume || shouldRecoverResidual
         ? extractDeepReadChaptersFromHtml(params.existingHtml)
         : []);
     if (params.outputWindow) {
@@ -1188,7 +1217,8 @@ export class NoteGenerator {
       extractRunnableDeepReadSlotIds(params.existingHtml).some(
         (slotId) => !plannedSlotIds.has(slotId),
       );
-    const resumeFromExisting = !!shouldResume && !planDesynced;
+    const resumeFromExisting =
+      (!!shouldResume && !planDesynced) || shouldRecoverResidual;
     if (planDesynced) {
       this.showDeepReadNotice(
         "检测到精读进度与章节结构不一致，已按当前结构重置并重新生成。",
@@ -1214,17 +1244,26 @@ export class NoteGenerator {
       params.itemTitle,
       template,
       planned,
+      promptLanguage,
     );
+    const initialHtml = shouldRecoverResidual
+      ? recoverDeepReadFromResidualHtml(params.existingHtml, skeleton, planned)
+      : skeleton;
     const note = resumeFromExisting
       ? (params.existing as Zotero.Item)
       : await AiNoteService.saveGeneratedNote({
           item: params.item,
           kind: "deepRead",
-          html: skeleton,
+          html: initialHtml,
           existing: params.existing,
           policy: params.policy === "append" ? "append" : "overwrite",
           lang: promptLanguage,
         });
+
+    if (shouldRecoverResidual) {
+      (note as any).setNote?.(initialHtml);
+      await (note as any).saveTx?.();
+    }
 
     // 本次调用中真正尝试运行（标记为“正在生成”）的 slot 数；用于区分“章节被跳过
     // （ID 错位/续跑错位）”与“章节尝试了但失败（接口异常）”，仅前者需要重建骨架。
@@ -1286,7 +1325,7 @@ export class NoteGenerator {
       const slot = retryableSlots.find((candidate) => candidate.id === slotId);
       if (!slot) return;
       const currentHtml = ((note as any).getNote?.() as string) || "";
-      if (isDeepReadSlotDone(currentHtml, slot.id)) {
+      if (!shouldRunDeepReadSlot(currentHtml, slot.id)) {
         this.showDeepReadNotice(
           "This slot is already done; retry skipped.",
           "success",

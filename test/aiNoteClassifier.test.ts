@@ -1,6 +1,7 @@
 import { expect } from "chai";
 import {
   classifyAiButlerNote,
+  isEnglishNoteVariant,
   isDeepReadNote,
   isRegularSummaryNote,
 } from "../src/modules/aiNoteClassifier";
@@ -54,5 +55,22 @@ describe("AI note classifier", function () {
     expect(isRegularSummaryNote([], deepReadHtml)).to.equal(false);
     expect(isRegularSummaryNote([], legacyDeepReadHtml)).to.equal(false);
     expect(classifyAiButlerNote([], deepReadHtml)).to.equal("deepRead");
+  });
+
+  it("recognizes English artifact headings and legacy language identity", function () {
+    const summaryHtml = "<h2>AI Summary - Paper</h2><p>Summary</p>";
+    const deepReadHtml = "<h1>AI Deep Read - Paper</h1><p>Detail</p>";
+    const imageHtml = "<h2>AI Image Summary - Paper</h2><img />";
+    const mindmapHtml = "<h2>AI Mindmap - Paper</h2><pre>Map</pre>";
+
+    expect(classifyAiButlerNote([], summaryHtml)).to.equal("summary");
+    expect(classifyAiButlerNote([], deepReadHtml)).to.equal("deepRead");
+    expect(classifyAiButlerNote([], imageHtml)).to.equal("imageSummary");
+    expect(classifyAiButlerNote([], mindmapHtml)).to.equal("mindmap");
+    expect(isEnglishNoteVariant([], summaryHtml)).to.equal(true);
+    expect(isEnglishNoteVariant([{ tag: "AI-English" }], "")).to.equal(true);
+    expect(isEnglishNoteVariant([], "<h2>AI 管家 - Paper</h2>")).to.equal(
+      false,
+    );
   });
 });
