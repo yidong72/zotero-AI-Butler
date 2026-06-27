@@ -1249,6 +1249,13 @@ export class NoteGenerator {
     const initialHtml = shouldRecoverResidual
       ? recoverDeepReadFromResidualHtml(params.existingHtml, skeleton, planned)
       : skeleton;
+    // Zotero sanitizes note HTML on every save and may remove both comment and
+    // custom-link slot markers. Keep a canonical copy for the active run so a
+    // save/read cycle cannot make later slots appear nonexistent.
+    let workingHtml =
+      shouldResume && resumeFromExisting && !shouldRecoverResidual
+        ? params.existingHtml
+        : initialHtml;
     const note = resumeFromExisting
       ? (params.existing as Zotero.Item)
       : await AiNoteService.saveGeneratedNote({
@@ -1281,7 +1288,7 @@ export class NoteGenerator {
         slot.phaseTitle,
       );
       writeQueue = writeQueue.then(async () => {
-        const currentHtml = ((note as any).getNote?.() as string) || "";
+        const currentHtml = workingHtml;
         const nextHtml = fillDeepReadSlot(
           currentHtml,
           slot.id,
@@ -1290,6 +1297,7 @@ export class NoteGenerator {
           status,
         );
         if (nextHtml !== currentHtml) {
+          workingHtml = nextHtml;
           (note as any).setNote?.(nextHtml);
           await (note as any).saveTx?.();
         }
@@ -1306,13 +1314,14 @@ export class NoteGenerator {
         slot.phaseTitle,
       );
       writeQueue = writeQueue.then(async () => {
-        const currentHtml = ((note as any).getNote?.() as string) || "";
+        const currentHtml = workingHtml;
         const nextHtml = markDeepReadSlotRunning(
           currentHtml,
           slot.id,
           slot.title,
         );
         if (nextHtml !== currentHtml) {
+          workingHtml = nextHtml;
           (note as any).setNote?.(nextHtml);
           await (note as any).saveTx?.();
         }
@@ -1324,7 +1333,7 @@ export class NoteGenerator {
     params.outputWindow?.setDeepReadRetryHandler?.(async (slotId) => {
       const slot = retryableSlots.find((candidate) => candidate.id === slotId);
       if (!slot) return;
-      const currentHtml = ((note as any).getNote?.() as string) || "";
+      const currentHtml = workingHtml;
       if (!shouldRunDeepReadSlot(currentHtml, slot.id)) {
         this.showDeepReadNotice(
           "This slot is already done; retry skipped.",
@@ -1366,7 +1375,7 @@ export class NoteGenerator {
       index: number,
       streamLive: boolean,
     ) => {
-      const currentHtml = ((note as any).getNote?.() as string) || "";
+      const currentHtml = workingHtml;
       if (!shouldRunDeepReadSlot(currentHtml, slot.id)) return;
 
       throwIfAborted(params.abortSignal);
@@ -1424,7 +1433,7 @@ export class NoteGenerator {
 
       for (let index = 0; index < planned.sequentialSlots.length; index++) {
         const slot = planned.sequentialSlots[index];
-        const currentHtml = ((note as any).getNote?.() as string) || "";
+        const currentHtml = workingHtml;
         if (!shouldRunDeepReadSlot(currentHtml, slot.id)) continue;
 
         throwIfAborted(params.abortSignal);
@@ -1519,7 +1528,7 @@ export class NoteGenerator {
       for (let pass = 0; pass < MAX_DEEP_READ_PASSES; pass++) {
         await runDeepReadPass();
 
-        const passHtml = ((note as any).getNote?.() as string) || "";
+        const passHtml = workingHtml;
         // \u6240\u6709\u7ae0\u8282\u5747\u5df2\u5b8c\u6210 \u2192 \u7ed3\u675f\u3002
         if (!hasRunnableDeepReadSlots(passHtml)) break;
         // \u7528\u6237\u4e3b\u52a8\u53d6\u6d88 \u2192 \u7ed3\u675f\uff08\u5269\u4f59\u7ae0\u8282\u4fdd\u6301\u53ef\u7eed\u8dd1\uff09\u3002
@@ -1546,13 +1555,15 @@ export class NoteGenerator {
         resumeFromExisting &&
         attemptedSlots === 0 &&
         params.abortSignal?.aborted !== true &&
-        hasRunnableDeepReadSlots(((note as any).getNote?.() as string) || "");
+        (hasRunnableDeepReadSlots(workingHtml) ||
+          noteHasDeepReadPlaceholderText(workingHtml));
       if (stillStuck) {
         this.showDeepReadNotice(
           "\u7eed\u8dd1\u65e0\u8fdb\u5c55\uff0c\u5df2\u6309\u5f53\u524d\u7ae0\u8282\u7ed3\u6784\u91cd\u7f6e\u5e76\u91cd\u65b0\u751f\u6210\u3002",
           "warning",
         );
         await writeQueue;
+        workingHtml = skeleton;
         (note as any).setNote?.(skeleton);
         await (note as any).saveTx?.();
         params.outputWindow?.setDeepReadProgressSlots?.(progressSlots);
@@ -1561,16 +1572,17 @@ export class NoteGenerator {
     } catch (error) {
       if (isAbortError(error, params.abortSignal)) {
         writeQueue = writeQueue.then(async () => {
-          const currentHtml = ((note as any).getNote?.() as string) || "";
+          const currentHtml = workingHtml;
           const nextHtml = resetRunningDeepReadSlots(currentHtml);
           if (nextHtml !== currentHtml) {
+            workingHtml = nextHtml;
             (note as any).setNote?.(nextHtml);
             await (note as any).saveTx?.();
           }
         });
         await writeQueue;
         for (const slot of progressSlots) {
-          const status = ((note as any).getNote?.() as string) || "";
+          const status = workingHtml;
           if (shouldRunDeepReadSlot(status, slot.id)) {
             params.outputWindow?.updateDeepReadProgressSlot?.(
               slot.id,
@@ -1585,7 +1597,7 @@ export class NoteGenerator {
     }
 
     await writeQueue;
-    const noteHtml = ((note as any).getNote?.() as string) || skeleton;
+    const noteHtml = workingHtml || skeleton;
     return {
       note,
       content: collected.join("\n\n---\n\n") || noteHtml,
