@@ -172,12 +172,12 @@
         const openBtn = document.getElementById("open-window");
         if (!openBtn) return;
 
-        const isViewerMode = (() => {
+        const displayMode = (() => {
           try {
             const params = new URLSearchParams(window.location.search);
-            return params.get("mode") === "viewer";
+            return params.get("mode") || "";
           } catch (e) {
-            return false;
+            return "";
           }
         })();
 
@@ -190,16 +190,26 @@
           }
         })();
 
-        if (isViewerMode || isTopLevel) {
+        if (
+          displayMode === "viewer" ||
+          displayMode === "detail" ||
+          isTopLevel
+        ) {
           openBtn.style.display = "none";
-          return;
+        } else {
+          openBtn.addEventListener("click", () => {
+            try {
+              window.parent.postMessage({ type: "open-mindmap-viewer" }, "*");
+            } catch (e) {}
+          });
         }
 
-        openBtn.addEventListener("click", () => {
-          try {
-            window.parent.postMessage({ type: "open-mindmap-viewer" }, "*");
-          } catch (e) {}
-        });
+        if (displayMode === "detail") {
+          const pngBtn = document.getElementById("export-png");
+          const opmlBtn = document.getElementById("export-opml");
+          if (pngBtn) pngBtn.style.display = "none";
+          if (opmlBtn) opmlBtn.style.display = "none";
+        }
       })();
 
       // PNG 导出功能

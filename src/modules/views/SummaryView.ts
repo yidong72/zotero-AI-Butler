@@ -25,6 +25,7 @@
 
 import { BaseView } from "./BaseView";
 import { MainWindow } from "./MainWindow";
+import { config } from "../../../package.json";
 import { marked } from "marked";
 import { getPref } from "../../utils/prefs";
 import { getString } from "../../utils/locale";
@@ -44,7 +45,45 @@ import {
   normalizeFollowUpChatNoteHtml,
   parseFollowUpChatPairsFromNoteHtml,
 } from "../noteMarkdown";
-import { AiNoteService } from "../aiNoteService";
+import { AiNoteService, type AiNoteKind } from "../aiNoteService";
+import { isEnglishNoteVariant } from "../aiNoteClassifier";
+import { prepareDeepReadHtmlForPresentation } from "../deepReadEngine";
+import type { PromptLang } from "../../utils/prompts";
+
+export type SavedAiNoteKind = AiNoteKind | "imageSummary" | "mindmap";
+
+export function getSavedAiNoteLabel(
+  kind: SavedAiNoteKind,
+  lang: PromptLang,
+): string {
+  if (lang === "en") {
+    return {
+      summary: "AI summary",
+      deepRead: "AI deep read",
+      imageSummary: "AI image summary",
+      mindmap: "AI mind map",
+    }[kind];
+  }
+  return {
+    summary: "AI 总结",
+    deepRead: "AI 精读",
+    imageSummary: "一图总结",
+    mindmap: "思维导图",
+  }[kind];
+}
+
+export function extractSavedMindmapMarkdown(noteHtml: string): string {
+  const match = noteHtml.match(/```markmap\s*\r?\n([\s\S]*?)\r?\n```/i);
+  if (!match?.[1]) return "";
+  return match[1]
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#0*39;/gi, "'")
+    .trim();
+}
 
 /**
  * AI 总结视图类
@@ -957,7 +996,7 @@ export class SummaryView extends BaseView {
   /**
    * 追加一张“AI 总结”卡片（可折叠，仅展示助手内容，不参与对话历史与持久化）
    */
-  private appendSummaryCard(aiSummary: string): void {
+  private appendSummaryCard(aiSummary: string, lang: PromptLang = "zh"): void {
     if (!this.outputContainer) return;
 
     const card = this.createElement("div", {
@@ -990,7 +1029,7 @@ export class SummaryView extends BaseView {
         color: "var(--ai-accent)",
         flexShrink: "0",
       },
-      textContent: "📘 AI管家笔记",
+      textContent: lang === "en" ? "AI Butler Note" : "AI管家笔记",
     });
     // 预览：取前100字符，去掉换行
     const previewText = (aiSummary || "").replace(/\s+/g, " ").slice(0, 100);
@@ -1005,7 +1044,7 @@ export class SummaryView extends BaseView {
         minWidth: "0",
       },
       textContent: previewText
-        ? `摘要：${previewText}${aiSummary.length > 100 ? "…" : ""}`
+        ? `${lang === "en" ? "Preview: " : "摘要："}${previewText}${aiSummary.length > 100 ? "…" : ""}`
         : "",
     }) as HTMLElement;
     header.appendChild(titleEl);
@@ -1035,7 +1074,7 @@ export class SummaryView extends BaseView {
           marginBottom: "8px",
           color: "var(--ai-text)",
         },
-        innerHTML: "🤖 AI管家",
+        textContent: lang === "en" ? "AI Butler" : "AI管家",
       }),
     );
     const contentDiv = this.createElement("div", {
@@ -1050,7 +1089,10 @@ export class SummaryView extends BaseView {
         userSelect: "text",
         cursor: "text",
       },
-      innerHTML: "<em>展开后渲染完整笔记...</em>",
+      innerHTML:
+        lang === "en"
+          ? "<em>Expand to render the full note...</em>"
+          : "<em>展开后渲染完整笔记...</em>",
     });
     assistantDiv.appendChild(contentDiv);
     body.appendChild(assistantDiv);
@@ -1069,7 +1111,7 @@ export class SummaryView extends BaseView {
       },
       innerHTML: "▸",
     }) as HTMLButtonElement;
-    collapseBtn.title = "折叠/展开";
+    collapseBtn.title = lang === "en" ? "Collapse/expand" : "折叠/展开";
     collapseBtn.addEventListener("click", () => {
       if ((body as HTMLElement).style.display === "none") {
         (body as HTMLElement).style.display = "block";
@@ -1221,71 +1263,71 @@ export class SummaryView extends BaseView {
    *
    * @param itemId 文献条目 ID
    */
-  public async loadItemForChat(itemId: number): Promise<void> {
+  public async loadItemForChat(
+    itemId: number,
+    lang?: PromptLang,
+  ): Promise<void> {
     try {
       // 清空并显示加载提示
+      let effectiveLang: PromptLang = lang || "zh";
+      this.clearPaperContext();
       this.clear();
-      this.showLoadingState("正在加载文献...");
+      this.showLoadingState(
+        lang === undefined
+          ? "正在加载文献 / Loading paper..."
+          : effectiveLang === "en"
+            ? "Loading paper..."
+            : "正在加载文献...",
+      );
 
       const item = await Zotero.Items.getAsync(itemId);
       if (!item) {
         this.hideLoading();
+        this.startItem(
+          effectiveLang === "en" ? "Paper unavailable" : "文献不可用",
+        );
+        this.appendContent(
+          effectiveLang === "en"
+            ? "This Zotero item no longer exists."
+            : "该 Zotero 条目已不存在。",
+        );
+        this.finishItem();
         new ztoolkit.ProgressWindow("AI Butler", {
           closeOnClick: true,
           closeTime: 3000,
         })
           .createLine({
-            text: "无法加载该文献",
+            text:
+              effectiveLang === "en"
+                ? "Unable to load this paper"
+                : "无法加载该文献",
             type: "error",
           })
           .show();
         return;
       }
 
-      const title = (item.getField("title") as string) || "文献";
+      const title =
+        (item.getField("title") as string) ||
+        (effectiveLang === "en" ? "Paper" : "文献");
 
       // 显示标题
       this.startItem(title);
       this.finishItem();
 
-      // 查找已有的 AI 总结笔记
-      const noteIDs = (item as any).getNotes?.() || [];
       let aiSummaryText = "";
-      let targetNote: any = null;
-
-      for (const nid of noteIDs) {
-        try {
-          const n = await Zotero.Items.getAsync(nid);
-          if (!n) continue;
-          const tags: Array<{ tag: string }> = (n as any).getTags?.() || [];
-          const noteHtml: string = (n as any).getNote?.() || "";
-          const isChatNote =
-            tags.some((t) => t.tag === "AI-Butler-Chat") ||
-            /<h2>\s*AI 管家\s*-\s*后续追问\s*-/.test(noteHtml);
-          // 支持所有 AI 生成的笔记类型：总结、思维导图、一图总结
-          const isAiSummaryNote =
-            tags.some((t) => t.tag === "AI-Generated") ||
-            tags.some((t) => t.tag === "AI-Mindmap") ||
-            tags.some((t) => t.tag === "AI-ImageSummary") ||
-            (/<h2>\s*AI 管家\s*-/.test(noteHtml) && !isChatNote);
-
-          if (isAiSummaryNote) {
-            if (!targetNote) {
-              targetNote = n;
-            } else {
-              const a = (targetNote as any).dateModified || 0;
-              const b = (n as any).dateModified || 0;
-              if (b > a) targetNote = n;
-            }
-          }
-        } catch (e) {
-          continue;
-        }
+      const targetNote =
+        (await this.resolveSavedAiNote(item, "summary", lang)) ||
+        (await this.resolveSavedAiNote(item, "deepRead", lang));
+      if (!lang && targetNote) {
+        effectiveLang = this.inferSavedNoteLanguage(targetNote);
       }
 
       // 提取 AI 总结内容
       if (targetNote) {
-        const html = (targetNote as any).getNote?.() || "";
+        const html = prepareDeepReadHtmlForPresentation(
+          (targetNote as any).getNote?.() || "",
+        );
         aiSummaryText = html
           .replace(/<style[^>]*>.*?<\/style>/gis, "")
           .replace(/<script[^>]*>.*?<\/script>/gis, "")
@@ -1295,6 +1337,9 @@ export class SummaryView extends BaseView {
           .replace(/&gt;/g, ">")
           .replace(/&amp;/g, "&")
           .trim();
+        if (aiSummaryText) {
+          this.appendSummaryCard(aiSummaryText, effectiveLang);
+        }
       }
 
       // 获取 PDF 内容以支持追问
@@ -1322,14 +1367,7 @@ export class SummaryView extends BaseView {
             aiSummaryText,
           );
 
-          // 如果有 AI 总结，显示总结卡片
-          if (aiSummaryText) {
-            try {
-              this.appendSummaryCard(aiSummaryText);
-            } catch (e) {
-              ztoolkit.log("[AI-Butler] 渲染 AI 总结卡片失败:", e);
-            }
-          } else {
+          if (!aiSummaryText) {
             // 没有已有总结，显示欢迎提示
             if (this.outputContainer) {
               const welcomeHint =
@@ -1342,7 +1380,17 @@ export class SummaryView extends BaseView {
                 border-left: 4px solid #59c0bc;
                 color: var(--ai-text);
               `;
-              welcomeHint.innerHTML = `
+              welcomeHint.innerHTML =
+                effectiveLang === "en"
+                  ? `
+                <div style="font-size: 15px; font-weight: 600; margin-bottom: 8px; color: #59c0bc;">
+                  Ready for follow-up questions
+                </div>
+                <div style="font-size: 13px; color: var(--ai-text-muted); line-height: 1.6;">
+                  This paper has no AI summary yet. You can ask a question below or generate an AI summary first.
+                </div>
+              `
+                  : `
                 <div style="font-size: 15px; font-weight: 600; margin-bottom: 8px; color: #59c0bc;">
                   🤖 准备好开始追问了！
                 </div>
@@ -1371,7 +1419,8 @@ export class SummaryView extends BaseView {
           ) as HTMLElement;
           if (inputArea && toggleBtn) {
             inputArea.style.display = "flex";
-            toggleBtn.innerHTML = "🔽 收起完整追问";
+            toggleBtn.textContent =
+              effectiveLang === "en" ? "Collapse follow-up" : "收起完整追问";
           }
 
           // 聚焦输入框
@@ -1388,7 +1437,10 @@ export class SummaryView extends BaseView {
             closeTime: 3000,
           })
             .createLine({
-              text: "该文献没有可用的 PDF 附件",
+              text:
+                effectiveLang === "en"
+                  ? "This paper has no available PDF attachment"
+                  : "该文献没有可用的 PDF 附件",
               type: "error",
             })
             .show();
@@ -1402,7 +1454,10 @@ export class SummaryView extends BaseView {
           closeTime: 3000,
         })
           .createLine({
-            text: "获取 PDF 内容失败",
+            text:
+              effectiveLang === "en"
+                ? "Unable to read the PDF"
+                : "获取 PDF 内容失败",
             type: "error",
           })
           .show();
@@ -1420,73 +1475,82 @@ export class SummaryView extends BaseView {
    *
    * @param itemId 文献条目ID
    */
-  public async showSavedNoteForItem(itemId: number): Promise<void> {
+  public async showSavedNoteForItem(
+    itemId: number,
+    kind: SavedAiNoteKind = "summary",
+    lang?: PromptLang,
+  ): Promise<void> {
     try {
       // 清空并显示加载提示
+      let effectiveLang: PromptLang = lang || "zh";
+      let artifactLabel = getSavedAiNoteLabel(kind, effectiveLang);
+      this.clearPaperContext();
       this.clear();
-      this.showLoadingState("正在加载已保存的总结...");
+      this.showLoadingState(
+        lang === undefined
+          ? "正在加载 AI 笔记 / Loading AI note..."
+          : effectiveLang === "en"
+            ? `Loading saved ${artifactLabel}...`
+            : `正在加载已保存的${artifactLabel}...`,
+      );
 
       const item = await Zotero.Items.getAsync(itemId);
       if (!item) {
         this.hideLoading();
+        this.startItem(
+          effectiveLang === "en" ? "Item unavailable" : "条目不可用",
+        );
+        this.appendContent(
+          effectiveLang === "en"
+            ? `The Zotero item for this saved ${artifactLabel} no longer exists.`
+            : `该已保存${artifactLabel}对应的 Zotero 条目已不存在。`,
+        );
+        this.finishItem();
         return;
       }
 
-      const title = (item.getField("title") as string) || "文献";
+      const title =
+        (item.getField("title") as string) ||
+        (effectiveLang === "en" ? "Paper" : "文献");
 
-      // 获取子笔记ID列表
-      const noteIDs = (item as any).getNotes?.() || [];
-      let targetNote: any = null;
-
-      // 遍历寻找带有 AI-Generated 标签或标题包含“AI 管家”的最新笔记
-      // 注意：应排除“后续追问”聊天笔记，避免把聊天内容直接渲染到总结区
-      for (const nid of noteIDs) {
-        try {
-          const n = await Zotero.Items.getAsync(nid);
-          if (!n) continue;
-          const tags: Array<{ tag: string }> = (n as any).getTags?.() || [];
-          const noteHtml: string = (n as any).getNote?.() || "";
-          const isChatNote =
-            tags.some((t) => t.tag === "AI-Butler-Chat") ||
-            /<h2>\s*AI 管家\s*-\s*后续追问\s*-/.test(noteHtml);
-          // 支持所有 AI 生成的笔记类型：总结、思维导图、一图总结
-          const isAiSummaryNote =
-            tags.some((t) => t.tag === "AI-Generated") ||
-            tags.some((t) => t.tag === "AI-Mindmap") ||
-            tags.some((t) => t.tag === "AI-ImageSummary") ||
-            (/<h2>\s*AI 管家\s*-/.test(noteHtml) && !isChatNote);
-
-          if (isAiSummaryNote) {
-            if (!targetNote) {
-              targetNote = n;
-            } else {
-              // 选择修改时间更新的那个
-              const a = (targetNote as any).dateModified || 0;
-              const b = (n as any).dateModified || 0;
-              if (b > a) targetNote = n;
-            }
-          }
-        } catch (e) {
-          // 忽略异常的子笔记，继续查找
-          continue;
-        }
+      const targetNote = await this.resolveSavedAiNote(item, kind, lang);
+      if (!lang && targetNote) {
+        effectiveLang = this.inferSavedNoteLanguage(targetNote);
+        artifactLabel = getSavedAiNoteLabel(kind, effectiveLang);
       }
 
       this.hideLoading();
 
       if (!targetNote) {
-        // 没有找到匹配的 AI 总结
         this.startItem(title);
-        this.appendContent("未找到已保存的 AI 总结笔记。");
+        this.appendContent(
+          effectiveLang === "en"
+            ? `No saved ${artifactLabel} was found.`
+            : `未找到已保存的${artifactLabel}。`,
+        );
         this.finishItem();
         return;
       }
 
-      // 读取 HTML 内容，提取纯文本作为“AI 总结”卡片展示（不直接把整段 HTML 塞进总结区）
-      const html = (targetNote as any).getNote?.() || "";
+      const rawHtml = (targetNote as any).getNote?.() || "";
       this.startItem(title);
-      // 不直接渲染 html 到 item-content，改为在下方追加可折叠的“AI 总结”卡片
       this.finishItem();
+
+      if (kind === "imageSummary") {
+        this.clearPaperContext();
+        await this.appendSavedImageArtifact(targetNote, effectiveLang);
+        return;
+      }
+
+      if (kind === "mindmap") {
+        this.clearPaperContext();
+        this.appendSavedMindmapArtifact(rawHtml, effectiveLang);
+        return;
+      }
+
+      // Present the saved note immediately. PDF extraction below only enables
+      // follow-up chat and must not control whether the artifact is visible.
+      const html = prepareDeepReadHtmlForPresentation(rawHtml);
 
       // 提取AI总结的纯文本内容(去除HTML标签)
       const aiSummaryText = html
@@ -1498,6 +1562,7 @@ export class SummaryView extends BaseView {
         .replace(/&gt;/g, ">")
         .replace(/&amp;/g, "&")
         .trim();
+      this.appendSummaryCard(aiSummaryText, effectiveLang);
 
       // 获取PDF内容以支持后续追问
       try {
@@ -1522,13 +1587,6 @@ export class SummaryView extends BaseView {
             aiSummaryText,
           );
 
-          // 在对话区域追加一张“AI 总结”卡片，默认可折叠
-          try {
-            this.appendSummaryCard(aiSummaryText);
-          } catch (e) {
-            ztoolkit.log("[AI-Butler] 渲染AI总结卡片失败:", e);
-          }
-
           // 载入并渲染已有的“后续追问”历史（如有），恢复为原生对话格式
           try {
             const itemObj = await Zotero.Items.getAsync(itemId);
@@ -1548,10 +1606,203 @@ export class SummaryView extends BaseView {
       }
     } catch (err) {
       this.hideLoading();
-      this.startItem("加载失败");
-      this.appendContent("无法加载该条目的已保存总结。");
+      const effectiveLang: PromptLang = lang || "zh";
+      const artifactLabel = getSavedAiNoteLabel(kind, effectiveLang);
+      this.startItem(effectiveLang === "en" ? "Load failed" : "加载失败");
+      this.appendContent(
+        effectiveLang === "en"
+          ? `Unable to load the saved ${artifactLabel}.`
+          : `无法加载该条目的已保存${artifactLabel}。`,
+      );
       this.finishItem();
       this.clearPaperContext();
+    }
+  }
+
+  private async appendSavedImageArtifact(
+    note: Zotero.Item,
+    lang: PromptLang,
+  ): Promise<void> {
+    if (!this.outputContainer) return;
+    const { ImageNoteGenerator } = await import("../imageNoteGenerator");
+    const imageSrc = await ImageNoteGenerator.getImageFromNote(note);
+    if (!imageSrc) {
+      this.appendSavedArtifactMessage(
+        lang === "en"
+          ? "The saved image summary could not be read."
+          : "无法读取已保存的一图总结。",
+      );
+      return;
+    }
+
+    const frame = this.createElement("section", {
+      styles: {
+        border: "1px solid var(--ai-border)",
+        borderRadius: "8px",
+        backgroundColor: "var(--ai-surface-2)",
+        padding: "12px",
+        marginBottom: "18px",
+        minWidth: "0",
+      },
+    });
+    frame.appendChild(
+      this.createElement("div", {
+        textContent: lang === "en" ? "AI Image Summary" : "一图总结",
+        styles: {
+          color: "var(--ai-accent)",
+          fontWeight: "600",
+          marginBottom: "10px",
+        },
+      }),
+    );
+    const image = this.createElement("img", {
+      attributes: {
+        alt: lang === "en" ? "AI image summary" : "AI 一图总结",
+      },
+      styles: {
+        display: "block",
+        width: "100%",
+        maxWidth: "100%",
+        height: "auto",
+        maxHeight: "70vh",
+        objectFit: "contain",
+        borderRadius: "4px",
+      },
+    }) as HTMLImageElement;
+    image.src = imageSrc;
+    frame.appendChild(image);
+    this.outputContainer.appendChild(frame);
+    this.applyTheme();
+  }
+
+  private appendSavedMindmapArtifact(noteHtml: string, lang: PromptLang): void {
+    if (!this.outputContainer) return;
+    const markdown = extractSavedMindmapMarkdown(noteHtml);
+    if (!markdown) {
+      this.appendSavedArtifactMessage(
+        lang === "en"
+          ? "The saved mind map could not be read."
+          : "无法读取已保存的思维导图。",
+      );
+      return;
+    }
+
+    const frame = this.createElement("section", {
+      styles: {
+        border: "1px solid var(--ai-border)",
+        borderRadius: "8px",
+        backgroundColor: "var(--ai-surface-2)",
+        padding: "12px",
+        marginBottom: "18px",
+        minWidth: "0",
+      },
+    });
+    frame.appendChild(
+      this.createElement("div", {
+        textContent: lang === "en" ? "AI Mind Map" : "思维导图",
+        styles: {
+          color: "var(--ai-accent)",
+          fontWeight: "600",
+          marginBottom: "10px",
+        },
+      }),
+    );
+    const iframe = this.createElement("iframe", {
+      attributes: {
+        title: lang === "en" ? "AI mind map" : "AI 思维导图",
+      },
+      styles: {
+        display: "block",
+        width: "100%",
+        height: "min(60vh, 560px)",
+        minHeight: "320px",
+        border: "1px solid var(--ai-border)",
+        borderRadius: "4px",
+        backgroundColor: "#fff",
+      },
+    }) as HTMLIFrameElement;
+    iframe.src = `chrome://${config.addonRef}/content/mindmap.html?mode=detail`;
+    iframe.addEventListener("load", () => {
+      const render = () => {
+        try {
+          iframe.contentWindow?.postMessage(
+            { type: "render-mindmap", markdown },
+            "*",
+          );
+        } catch (error) {
+          ztoolkit.log("[AI-Butler] 发送思维导图内容失败:", error);
+        }
+      };
+      render();
+      setTimeout(render, 300);
+    });
+    frame.appendChild(iframe);
+    this.outputContainer.appendChild(frame);
+    this.applyTheme();
+  }
+
+  private appendSavedArtifactMessage(message: string): void {
+    if (!this.outputContainer) return;
+    this.outputContainer.appendChild(
+      this.createElement("div", {
+        textContent: message,
+        styles: {
+          color: "var(--ai-text-muted)",
+          padding: "16px 0",
+        },
+      }),
+    );
+  }
+
+  private async resolveSavedAiNote(
+    item: Zotero.Item,
+    kind: SavedAiNoteKind,
+    lang?: PromptLang,
+  ): Promise<Zotero.Item | null> {
+    const languages: PromptLang[] = lang ? [lang] : ["zh", "en"];
+    let notes: Array<Zotero.Item | null> = [];
+
+    if (kind === "summary" || kind === "deepRead") {
+      const records = await Promise.all(
+        languages.map((language) =>
+          AiNoteService.findNoteRecord(item, kind, language),
+        ),
+      );
+      notes = records.map((record) => record?.note || null);
+    } else if (kind === "imageSummary") {
+      const { ImageNoteGenerator } = await import("../imageNoteGenerator");
+      notes = await Promise.all(
+        languages.map((language) =>
+          ImageNoteGenerator.findExistingImageNote(item, language),
+        ),
+      );
+    } else {
+      const { MindmapService } = await import("../mindmapService");
+      notes = await Promise.all(
+        languages.map((language) =>
+          MindmapService.findExistingMindmapNote(item, language),
+        ),
+      );
+    }
+
+    return (
+      notes
+        .filter((note): note is Zotero.Item => !!note)
+        .sort((left, right) =>
+          String((right as any).dateModified || "").localeCompare(
+            String((left as any).dateModified || ""),
+          ),
+        )[0] || null
+    );
+  }
+
+  private inferSavedNoteLanguage(note: Zotero.Item): PromptLang {
+    try {
+      const tags = (note as any).getTags?.() || [];
+      const html = (note as any).getNote?.() || "";
+      return isEnglishNoteVariant(tags, html) ? "en" : "zh";
+    } catch {
+      return "zh";
     }
   }
 

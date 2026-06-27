@@ -69,6 +69,8 @@ import {
   extractRunnableDeepReadSlotIds,
   fillDeepReadSlot,
   hasDeepReadV2Slots,
+  hasLegacyDeepReadRecoveryArtifacts,
+  hasResumableDeepReadSlots,
   hasRunnableDeepReadSlots,
   noteHasDeepReadPlaceholderText,
   markDeepReadSlotRunning,
@@ -183,14 +185,17 @@ export class NoteGenerator {
         noteKind === "deepRead" &&
         !!existingRecord?.rawHtml &&
         hasDeepReadV2Slots(existingRecord.rawHtml) &&
-        hasRunnableDeepReadSlots(existingRecord.rawHtml);
+        hasResumableDeepReadSlots(existingRecord.rawHtml);
       // 损坏的 AI 精读笔记：标记被 Zotero 清洗丢失但正文仍残留“等待生成/正在生成”
       // 占位符，章节其实从未生成。无法逐章续跑，需要整体重新生成（不可跳过）。
       const deepReadHasResidualPlaceholder =
         noteKind === "deepRead" &&
         !!existingRecord?.rawHtml &&
         !canResumeDeepRead &&
-        noteHasDeepReadPlaceholderText(existingRecord.rawHtml);
+        (noteHasDeepReadPlaceholderText(existingRecord.rawHtml) ||
+          hasLegacyDeepReadRecoveryArtifacts(existingRecord.rawHtml) ||
+          (hasDeepReadV2Slots(existingRecord.rawHtml) &&
+            hasRunnableDeepReadSlots(existingRecord.rawHtml)));
       if (
         existing &&
         !options?.forceOverwrite &&
@@ -1104,14 +1109,17 @@ export class NoteGenerator {
     const shouldResume =
       params.existing &&
       hasDeepReadV2Slots(params.existingHtml) &&
-      hasRunnableDeepReadSlots(params.existingHtml);
+      hasResumableDeepReadSlots(params.existingHtml);
     const shouldRecoverResidual =
       !!params.existing &&
-      !hasDeepReadV2Slots(params.existingHtml) &&
-      noteHasDeepReadPlaceholderText(params.existingHtml);
-    const restoredPlan = shouldResume
-      ? extractDeepReadPlanMetadata(params.existingHtml)
-      : null;
+      !shouldResume &&
+      (noteHasDeepReadPlaceholderText(params.existingHtml) ||
+        hasLegacyDeepReadRecoveryArtifacts(params.existingHtml) ||
+        extractRunnableDeepReadSlotIds(params.existingHtml).length > 0);
+    const restoredPlan =
+      shouldResume || shouldRecoverResidual
+        ? extractDeepReadPlanMetadata(params.existingHtml)
+        : null;
     const templateChanged =
       !!restoredPlan?.templateId &&
       restoredPlan.templateId !== currentTemplate.id;
@@ -1156,7 +1164,7 @@ export class NoteGenerator {
     let chapters =
       restoredPlan?.chapters ||
       (shouldResume || shouldRecoverResidual
-        ? extractDeepReadChaptersFromHtml(params.existingHtml)
+        ? extractDeepReadChaptersFromHtml(params.existingHtml, promptLanguage)
         : []);
     if (params.outputWindow) {
       params.outputWindow.startItem(params.itemTitle);
@@ -1246,14 +1254,20 @@ export class NoteGenerator {
       planned,
       promptLanguage,
     );
-    const initialHtml = shouldRecoverResidual
-      ? recoverDeepReadFromResidualHtml(params.existingHtml, skeleton, planned)
+    const rebuildWithRecovery = shouldRecoverResidual || planDesynced;
+    const initialHtml = rebuildWithRecovery
+      ? recoverDeepReadFromResidualHtml(
+          params.existingHtml,
+          skeleton,
+          planned,
+          promptLanguage,
+        )
       : skeleton;
     // Zotero sanitizes note HTML on every save and may remove both comment and
     // custom-link slot markers. Keep a canonical copy for the active run so a
     // save/read cycle cannot make later slots appear nonexistent.
     let workingHtml =
-      shouldResume && resumeFromExisting && !shouldRecoverResidual
+      shouldResume && resumeFromExisting && !rebuildWithRecovery
         ? params.existingHtml
         : initialHtml;
     const note = resumeFromExisting

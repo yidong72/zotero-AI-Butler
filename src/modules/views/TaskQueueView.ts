@@ -35,8 +35,21 @@ import { MainWindow } from "./MainWindow";
 import { TaskQueueManager, TaskItem, TaskStatus, TaskType } from "../taskQueue";
 import { TaskArtifacts } from "../taskArtifacts";
 import { createCard } from "./ui/components";
+import type { SavedAiNoteKind } from "./SummaryView";
 
 // 使用任务队列模块中定义的类型,避免重复定义导致的偏差
+
+export function getCompletedTaskSavedNoteKind(
+  taskType: TaskType | undefined,
+): SavedAiNoteKind | null {
+  if (taskType === undefined) return "summary";
+  return taskType === "summary" ||
+    taskType === "deepRead" ||
+    taskType === "imageSummary" ||
+    taskType === "mindmap"
+    ? taskType
+    : null;
+}
 
 /**
  * 任务队列视图类
@@ -706,13 +719,40 @@ export class TaskQueueView extends BaseView {
       await win.open("summary");
       const view = win.getSummaryView();
       view.clear();
+      const taskLang = task.promptLanguage || "zh";
       // 使用任务的 startedAt 作为计时起点，避免每次进入都从 0 开始
       const startedAt = task.startedAt || undefined;
-      view.showLoadingState(`正在分析「${task.title}」`, startedAt);
+      view.showLoadingState(
+        taskLang === "en"
+          ? `Analyzing "${task.title}"`
+          : `正在分析「${task.title}」`,
+        startedAt,
+      );
 
       // 若任务已完成,无法再接收流，回退展示已保存笔记
       if (task.status === TaskStatus.COMPLETED) {
-        await view.showSavedNoteForItem(task.itemId);
+        const savedKind = getCompletedTaskSavedNoteKind(task.taskType);
+        if (savedKind) {
+          await view.showSavedNoteForItem(task.itemId, savedKind, taskLang);
+        } else {
+          view.clear();
+          view.startItem(task.title);
+          view.appendContent(
+            taskLang === "en"
+              ? task.taskType === "tableFill"
+                ? "The table result was saved to the literature review table. Open Literature Review to view it."
+                : task.taskType === "review"
+                  ? "The review result was saved to the review note. Open Literature Review to view it."
+                  : "The targeted-question result was saved to its note or table. Open the item notes or Literature Review to view it."
+              : task.taskType === "tableFill"
+                ? "填表结果已写入文献综述表，请在文献综述视图中查看。"
+                : task.taskType === "review"
+                  ? "综述结果已写入综述笔记，请在文献综述视图中查看。"
+                  : "针对性提问结果已写入对应笔记或表格，请在条目笔记或文献综述视图中查看。",
+          );
+          view.finishItem();
+          view.clearPaperContext();
+        }
         return;
       }
 

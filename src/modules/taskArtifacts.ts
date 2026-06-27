@@ -4,6 +4,7 @@ import { MindmapService } from "./mindmapService";
 import { NoteGenerator } from "./noteGenerator";
 import { AiNoteService } from "./aiNoteService";
 import {
+  hasLegacyDeepReadRecoveryArtifacts,
   hasRunnableDeepReadSlots,
   noteHasDeepReadPlaceholderText,
 } from "./deepReadEngine";
@@ -94,6 +95,9 @@ export class TaskArtifacts {
     // 标记被清洗丢失但正文仍残留占位符 → 视为损坏未完成，需要整体重生。
     if (noteHasDeepReadPlaceholderText(noteHtml)) {
       return { exists: false, reason: "deep-read-placeholder-residual" };
+    }
+    if (hasLegacyDeepReadRecoveryArtifacts(noteHtml)) {
+      return { exists: false, reason: "deep-read-recovery-residual" };
     }
 
     return { exists: true };

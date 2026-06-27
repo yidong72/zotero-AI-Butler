@@ -18,6 +18,7 @@ import {
   LLMNoteMetadataService,
   type LLMNoteMetadata,
 } from "./llmNoteMetadata";
+import { repairRecoveredDeepReadHtml } from "./deepReadEngine";
 
 export type AiNoteKind = "summary" | "deepRead";
 
@@ -99,6 +100,35 @@ export class AiNoteService {
         if (!target || compareModified(note, target) > 0) {
           target = note as Zotero.Item;
           rawHtml = noteHtml;
+        }
+      }
+
+      if (target && kind === "deepRead") {
+        try {
+          const repairedHtml = repairRecoveredDeepReadHtml(rawHtml);
+          if (repairedHtml !== rawHtml) {
+            (target as any).setNote?.(repairedHtml);
+            await (target as any).saveTx?.();
+            rawHtml = ((target as any).getNote?.() as string) || repairedHtml;
+            ztoolkit.log(
+              `[AI-Butler] 已将旧版 AI 精读恢复内容归位到对应章节: ${target.id}`,
+            );
+          }
+        } catch (error) {
+          try {
+            if (((target as any).getNote?.() || "") !== rawHtml) {
+              (target as any).setNote?.(rawHtml);
+            }
+          } catch (restoreError) {
+            ztoolkit.log(
+              `[AI-Butler] 恢复未保存的 AI 精读内存状态失败: ${target.id}`,
+              restoreError,
+            );
+          }
+          ztoolkit.log(
+            `[AI-Butler] 修复旧版 AI 精读恢复内容失败，继续使用原笔记: ${target.id}`,
+            error,
+          );
         }
       }
 

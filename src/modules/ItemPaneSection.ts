@@ -38,6 +38,10 @@ import {
 } from "./noteMarkdown";
 import { AiNoteService, type AiNoteKind } from "./aiNoteService";
 import { SummaryView } from "./views/SummaryView";
+import {
+  prepareDeepReadHtmlForPresentation,
+  preservesDeepReadDurableMarkers,
+} from "./deepReadEngine";
 import katex from "katex";
 // 注意: 不在主进程中直接 import 思维导图库（如 markmap-view、simple-mind-map）
 // 这些库在加载时会访问 document/window，而 Zotero Background 进程没有 DOM 环境
@@ -391,10 +395,24 @@ function getSidebarEditorSelectionData(
   if (!doc) return null;
   const wrapper = doc.createElement("div");
   wrapper.appendChild(range.cloneContents());
+  const html = prepareDeepReadHtmlForPresentation(String(wrapper.innerHTML));
+  const blockAwareHtml = addSidebarClipboardBlockBreaks(html);
   return {
-    html: String(wrapper.innerHTML),
-    text: selection.toString(),
+    html,
+    text: decodeHtmlFragmentToText(doc, blockAwareHtml)
+      .replace(/[\u200B-\u200D\uFEFF]/g, "")
+      .replace(/\r\n?/g, "\n")
+      .replace(/[ \t]+\n/g, "\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim(),
   };
+}
+
+export function addSidebarClipboardBlockBreaks(html: string): string {
+  return html
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<li\b[^>]*>/gi, "\n$&")
+    .replace(/<\/(?:h[1-6]|p|div|li|blockquote|pre|tr|ul|ol|table)>/gi, "$&\n");
 }
 
 function cutSidebarEditorSelection(
@@ -428,6 +446,30 @@ function handleSidebarEditorCommandEvent(
 
   if (event.type === "cut") {
     cutSidebarEditorSelection(noteContent, event as ClipboardEvent);
+    stopSidebarEditEvent(event);
+    return true;
+  }
+
+  if (event.type === "dragstart" || event.type === "drop") {
+    stopSidebarEditEvent(event);
+    return true;
+  }
+
+  if (event.type === "copy") {
+    const selectionData = getSidebarEditorSelectionData(noteContent);
+    if (!selectionData) return false;
+    const clipboardEvent = event as ClipboardEvent;
+    if (clipboardEvent.clipboardData) {
+      clipboardEvent.clipboardData.setData("text/plain", selectionData.text);
+      clipboardEvent.clipboardData.setData("text/html", selectionData.html);
+    } else {
+      const doc = noteContent.ownerDocument;
+      if (doc) {
+        void copyToClipboard(doc, selectionData.text).catch((err) => {
+          ztoolkit.log("[AI-Butler] 复制编辑内容失败:", err);
+        });
+      }
+    }
     stopSidebarEditEvent(event);
     return true;
   }
@@ -508,8 +550,10 @@ function bindSidebarNoteEditEventGuards(noteContent: HTMLElement): void {
     "compositionstart",
     "compositionupdate",
     "compositionend",
+    "dragstart",
+    "drop",
   ];
-  const commandEvents = ["keydown", "beforeinput", "cut"];
+  const commandEvents = ["keydown", "beforeinput", "cut", "dragstart", "drop"];
 
   for (const eventName of events) {
     noteContent.addEventListener(eventName, stopEditingEvent, true);
@@ -3845,7 +3889,7 @@ function normalizeEditableNoteHtml(html: string): string {
 
 function hasRenderableSidebarHtml(html: string): boolean {
   return (
-    html
+    prepareDeepReadHtmlForPresentation(html)
       .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, "")
       .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, "")
       .replace(/<!--[^]*?-->/g, "")
@@ -4146,6 +4190,15 @@ async function saveSidebarNoteEdit(
           editedHtml,
         )
       : editedHtml;
+
+    if (
+      noteKind === "deepRead" &&
+      !preservesDeepReadDurableMarkers(latestHtml, nextHtml)
+    ) {
+      throw new Error(
+        "精读进度标记在编辑过程中被删除。为避免破坏续跑状态，本次保存已取消；请刷新后重新编辑正文。",
+      );
+    }
 
     (latestNote as any).setNote(nextHtml);
     await (latestNote as any).saveTx();
@@ -4529,6 +4582,7 @@ async function loadNoteContent(
         ? summaryBlocks[selectedBlockIndex].content
         : rawNoteHtml;
     aiNoteContent = LLMNoteMetadataService.stripSidebarMetadata(aiNoteContent);
+    aiNoteContent = prepareDeepReadHtmlForPresentation(aiNoteContent);
 
     // 加载主题 CSS
     const { themeManager } = await import("./themeManager");
@@ -5383,8 +5437,10 @@ async function getNoteMarkdownContent(
         : -1;
     const selectedBlock =
       selectedBlockIndex >= 0 ? summaryBlocks[selectedBlockIndex] : null;
-    const noteHtml: string = LLMNoteMetadataService.stripSidebarMetadata(
-      selectedBlock ? selectedBlock.content : resolvedNote.rawHtml,
+    const noteHtml: string = prepareDeepReadHtmlForPresentation(
+      LLMNoteMetadataService.stripSidebarMetadata(
+        selectedBlock ? selectedBlock.content : resolvedNote.rawHtml,
+      ),
     );
     // 将 HTML 转换为 Markdown 文本
     return htmlToMarkdown(noteHtml);
@@ -5400,8 +5456,8 @@ async function getNoteMarkdownContent(
  * @param html HTML 字符串
  * @returns Markdown 格式的字符串
  */
-function htmlToMarkdown(html: string): string {
-  let result = html;
+export function htmlToMarkdown(html: string): string {
+  let result = prepareDeepReadHtmlForPresentation(html);
 
   // 移除 style 和 script 标签及其内容
   result = result.replace(/<style[^>]*>.*?<\/style>/gis, "");
