@@ -29,6 +29,12 @@ import {
   normalizeAbortError,
   throwIfAborted,
 } from "./llmproviders/shared/requestAbort";
+import {
+  classifyRequestFailure,
+  isPayloadTooLargeFailure,
+  normalizeRequestFailureMessage,
+  type RequestFailureKind,
+} from "./llmproviders/shared/requestFailure";
 import type {
   ConversationMessage,
   LLMAbortSignal,
@@ -39,6 +45,14 @@ import type {
   LLMResponse,
   ProgressCb,
 } from "./llmproviders/types";
+
+function logLLMService(...args: Parameters<ZToolkit["log"]>): void {
+  try {
+    if (typeof ztoolkit !== "undefined") ztoolkit.log(...args);
+  } catch {
+    // Diagnostics must never change request behavior.
+  }
+}
 
 export type LLMTask =
   | "summary"
@@ -89,6 +103,8 @@ type LLMLegacyContent = {
   content: string;
   isBase64: boolean;
   policy?: LLMContentPolicy;
+  /** Optional source used to recover with extracted text after a size rejection. */
+  fallbackItem?: Zotero.Item;
 };
 
 export type LLMContentInput =
@@ -159,16 +175,76 @@ type ResolvedProvider = {
   endpoint?: LLMEndpoint;
 };
 
+// NVIDIA's gateway rejects request bodies above 32 MiB. Keep enough room for
+// JSON framing, prompts, and deep-read conversation history.
+export const SAFE_INLINE_REQUEST_BYTES = 24 * 1024 * 1024;
+const REQUEST_ENVELOPE_RESERVE_BYTES = 64 * 1024;
+const MAX_API_ATTEMPTS = 5;
+
+export function estimateBase64Length(rawBytes: number): number {
+  if (!Number.isFinite(rawBytes) || rawBytes <= 0) return 0;
+  return Math.ceil(rawBytes / 3) * 4;
+}
+
+export function utf8ByteLength(value: string): number {
+  try {
+    return new TextEncoder().encode(value).byteLength;
+  } catch {
+    return encodeURIComponent(value).replace(/%[0-9A-F]{2}/gi, "x").length;
+  }
+}
+
+export function estimateInlinePdfRequestBytes(
+  inlineBase64Bytes: number,
+  requestText: string = "",
+): number {
+  return (
+    Math.max(0, inlineBase64Bytes) +
+    utf8ByteLength(requestText) +
+    REQUEST_ENVELOPE_RESERVE_BYTES
+  );
+}
+
+export class LLMRequestTooLargeError extends Error {
+  public readonly suppressTaskRetry: boolean;
+  public readonly failureKind: RequestFailureKind;
+  public readonly estimatedBytes: number;
+  public readonly maxBytes: number;
+  public readonly originalError?: Error;
+
+  constructor(estimatedBytes: number, maxBytes: number, originalError?: Error) {
+    const originalFailure = classifyRequestFailure(originalError);
+    const extractionCanRetry = originalFailure.kind === "extraction";
+    const estimate = (estimatedBytes / (1024 * 1024)).toFixed(1);
+    const limit = (maxBytes / (1024 * 1024)).toFixed(0);
+    super(
+      originalError
+        ? `PDF request exceeded the safe ${limit} MiB payload budget and automatic text extraction failed: ${originalError.message}`
+        : `PDF request is approximately ${estimate} MiB, above the safe ${limit} MiB payload budget, and cannot be converted to text automatically.`,
+    );
+    this.name = "LLMRequestTooLargeError";
+    this.failureKind = extractionCanRetry ? "extraction" : "payload-too-large";
+    this.suppressTaskRetry = !extractionCanRetry;
+    this.estimatedBytes = estimatedBytes;
+    this.maxBytes = maxBytes;
+    this.originalError = originalError;
+  }
+}
+
 export class LLMApiCallError extends Error {
-  public readonly suppressTaskRetry = true;
+  public readonly suppressTaskRetry: boolean;
+  public readonly failureKind: RequestFailureKind;
   public readonly endpointId: string;
   public readonly endpointName: string;
   public readonly providerId: string;
   public readonly originalError?: Error;
 
   constructor(endpoint: LLMEndpoint, error: Error) {
-    super(error.message);
+    const failure = classifyRequestFailure(error);
+    super(normalizeRequestFailureMessage(error));
     this.name = "LLMApiCallError";
+    this.failureKind = failure.kind;
+    this.suppressTaskRetry = !failure.retryable;
     this.endpointId = endpoint.id;
     this.endpointName = endpoint.name;
     this.providerId = endpoint.providerType;
@@ -178,19 +254,35 @@ export class LLMApiCallError extends Error {
 }
 
 export class LLMApiExhaustedError extends Error {
-  public readonly suppressTaskRetry = true;
+  public readonly suppressTaskRetry: boolean;
+  public readonly failureKind: RequestFailureKind;
   public readonly attempts: number;
   public readonly lastError?: Error;
   public readonly endpointId?: string;
   public readonly endpointName?: string;
   public readonly providerId?: string;
+  public readonly errors: readonly Error[];
 
-  constructor(attempts: number, lastError?: Error) {
-    super(lastError?.message || "All configured LLM endpoints failed.");
+  constructor(attempts: number, lastError?: Error, errors: Error[] = []) {
+    const outcomes =
+      errors.length > 0 ? [...errors] : lastError ? [lastError] : [];
+    const retryableError = [...outcomes]
+      .reverse()
+      .find((error) => classifyRequestFailure(error).retryable);
+    const representativeError = retryableError || lastError;
+    const failure = classifyRequestFailure(representativeError);
+    super(
+      lastError
+        ? normalizeRequestFailureMessage(lastError)
+        : "All configured LLM endpoints failed.",
+    );
     this.name = "LLMApiExhaustedError";
+    this.failureKind = failure.kind;
+    this.suppressTaskRetry = !failure.retryable;
     this.attempts = attempts;
     this.lastError = lastError;
-    const apiError = lastError as
+    this.errors = outcomes;
+    const apiError = representativeError as
       | {
           endpointId?: string;
           endpointName?: string;
@@ -205,6 +297,8 @@ export class LLMApiExhaustedError extends Error {
 }
 
 export class LLMService {
+  private static readonly forcedTextContentKeys = new Set<string>();
+
   static getRequestTimeout(): number {
     const raw = (getPref("requestTimeout") as string) || "300000";
     const val = parseInt(raw, 10) || 300000;
@@ -272,6 +366,33 @@ export class LLMService {
     } catch {
       return LLMEndpointManager.getGlobalPdfProcessMode();
     }
+  }
+
+  /** Prepare reusable chat/deep-read content without allocating oversized Base64. */
+  static async prepareReusableItemContent(
+    item: Zotero.Item,
+    mode: LLMPdfProcessMode = this.getEffectivePdfProcessMode(),
+  ): Promise<{ content: string; isBase64: boolean }> {
+    if (mode === "base64") {
+      const attachments = await PDFExtractor.getAllPdfAttachments(item);
+      const firstAttachment = attachments[0];
+      const rawBytes = firstAttachment
+        ? await PDFExtractor.getPdfAttachmentFileSizeBytes(firstAttachment)
+        : 0;
+      const estimatedBytes = rawBytes
+        ? estimateInlinePdfRequestBytes(estimateBase64Length(rawBytes))
+        : 0;
+      if (estimatedBytes <= SAFE_INLINE_REQUEST_BYTES) {
+        return {
+          content: await PDFExtractor.extractBase64FromItem(item),
+          isBase64: true,
+        };
+      }
+      mode = "text";
+    }
+
+    const text = await PDFExtractor.extractTextFromItem(item, mode);
+    return { content: this.normalizeText(text), isBase64: false };
   }
 
   static buildOptions(
@@ -457,6 +578,44 @@ export class LLMService {
     return this.runChatWithFixedEndpoint(endpoint, request);
   }
 
+  /**
+   * Keep a multi-round session on its preferred endpoint while sharing one
+   * bounded retry budget with every configured fallback endpoint.
+   */
+  static async chatWithPreferredEndpoint(
+    preferredEndpointId: string,
+    request: LLMChatRequest,
+    allowFallback: boolean = true,
+  ): Promise<LLMResponse> {
+    let preferred: LLMEndpoint | undefined;
+    let preferredError: unknown;
+    try {
+      preferred = this.getRunnableEndpoint(preferredEndpointId);
+    } catch (error) {
+      preferredError = error;
+      if (!allowFallback) throw error;
+    }
+
+    const route = LLMEndpointManager.prepareRoute();
+    const endpoints = preferred
+      ? [
+          preferred,
+          ...(allowFallback
+            ? route.endpoints.filter(
+                (endpoint) => endpoint.id !== preferredEndpointId,
+              )
+            : []),
+        ]
+      : route.endpoints;
+    if (endpoints.length === 0 && preferredError) throw preferredError;
+
+    return this.chatWithEndpointRouting(
+      request,
+      { ...route, endpoints },
+      false,
+    );
+  }
+
   static async chatText(request: LLMChatRequest): Promise<string> {
     return (await this.chat(request)).text;
   }
@@ -523,6 +682,44 @@ export class LLMService {
     return this.getProviderCapabilities(provider).supportsPdfBase64;
   }
 
+  private static async waitBeforeRetry(
+    completedAttempts: number,
+    error: unknown,
+    abortSignal?: LLMAbortSignal,
+  ): Promise<void> {
+    throwIfAborted(abortSignal);
+    const failure = classifyRequestFailure(error);
+    const baseDelay = failure.kind === "rate-limit" ? 2000 : 1000;
+    const delayMs = Math.min(
+      baseDelay * Math.pow(2, Math.max(0, completedAttempts - 1)),
+      8000,
+    );
+    await Zotero.Promise.delay(delayMs);
+    throwIfAborted(abortSignal);
+  }
+
+  private static canRetryFailure(
+    error: unknown,
+    completedAttempts: number,
+    maxAttempts: number,
+    errors: readonly Error[] = [],
+  ): boolean {
+    const failure = classifyRequestFailure(error);
+    if (!failure.retryable || completedAttempts >= maxAttempts) return false;
+    // Changing endpoints cannot repair local PDF indexing. Let the persisted
+    // task queue retry after Zotero has had more time to finish extraction.
+    if (failure.kind === "extraction") return false;
+    // A five-minute timeout is already expensive. Permit one fresh request,
+    // then hand control back to the persisted task queue for delayed recovery.
+    const timeoutAttempts = errors.length
+      ? errors.filter(
+          (candidate) => classifyRequestFailure(candidate).kind === "timeout",
+        ).length
+      : completedAttempts;
+    if (failure.kind === "timeout" && timeoutAttempts >= 2) return false;
+    return true;
+  }
+
   private static getRunnableEndpoint(endpointId: string): LLMEndpoint {
     const endpoint = LLMEndpointManager.getEndpoint(endpointId);
     if (!endpoint) {
@@ -551,12 +748,28 @@ export class LLMService {
   ): Promise<LLMResponse> {
     const route = LLMEndpointManager.prepareRoute();
     const useRetry = request.transport?.retry ?? true;
-    const maxRetries = useRetry ? route.maxAttempts : 1;
+    const maxRetries = useRetry
+      ? Math.min(Math.max(route.maxAttempts, 1), MAX_API_ATTEMPTS)
+      : 1;
     let lastError: Error | null = null;
+    let attempts = 0;
+    let cursor = 0;
+    const errors: Error[] = [];
+    const terminalEndpoints = new Set<string>();
 
-    for (let attempt = 0; attempt < maxRetries; attempt++) {
+    while (attempts < maxRetries) {
       throwIfAborted(request.transport?.abortSignal);
-      const endpoint = route.endpoints[attempt % route.endpoints.length];
+      let endpoint: LLMEndpoint | undefined;
+      for (let checked = 0; checked < route.endpoints.length; checked++) {
+        const candidate = route.endpoints[cursor % route.endpoints.length];
+        cursor++;
+        if (!terminalEndpoints.has(candidate.id)) {
+          endpoint = candidate;
+          break;
+        }
+      }
+      if (!endpoint) break;
+      attempts++;
       try {
         const response = await this.generateOnceWithEndpoint(
           endpoint,
@@ -571,13 +784,30 @@ export class LLMService {
         }
         LLMEndpointManager.markEndpointAttempted(endpoint.id);
         lastError = error instanceof Error ? error : new Error(String(error));
-        ztoolkit.log(
-          `[LLMService] API failed via ${endpoint.name} (${attempt + 1}/${maxRetries}): ${lastError.message}`,
+        errors.push(lastError);
+        logLLMService(
+          `[LLMService] API failed via ${endpoint.name} (${attempts}/${maxRetries}): ${lastError.message}`,
         );
+        const failure = classifyRequestFailure(lastError);
+        if (!failure.retryable) terminalEndpoints.add(endpoint.id);
+        const hasCandidate = route.endpoints.some(
+          (candidate) => !terminalEndpoints.has(candidate.id),
+        );
+        if (!hasCandidate) break;
+        if (failure.retryable) {
+          if (!this.canRetryFailure(lastError, attempts, maxRetries, errors)) {
+            break;
+          }
+          await this.waitBeforeRetry(
+            attempts,
+            lastError,
+            request.transport?.abortSignal,
+          );
+        }
       }
     }
 
-    throw new LLMApiExhaustedError(maxRetries, lastError || undefined);
+    throw new LLMApiExhaustedError(attempts, lastError || undefined, errors);
   }
 
   private static async generateOnceWithEndpoint(
@@ -588,52 +818,85 @@ export class LLMService {
     const provider = this.getProviderForEndpoint(endpoint);
     const warnings: string[] = [];
     throwIfAborted(request.transport?.abortSignal);
-    const resolved = await this.resolveContent(
-      provider,
-      request.content,
-      warnings,
-      true,
-      endpoint,
-    );
+    let resolved: ResolvedContent;
+    try {
+      resolved = await this.resolveContentForRequest(
+        provider,
+        request.content,
+        warnings,
+        true,
+        endpoint,
+        prompt,
+      );
+    } catch (error: unknown) {
+      if (isAbortError(error, request.transport?.abortSignal)) {
+        throw normalizeAbortError(error, request.transport?.abortSignal);
+      }
+      throw this.toApiCallError(endpoint, error);
+    }
     throwIfAborted(request.transport?.abortSignal);
     const options = this.buildOptions(
       endpoint,
       request.generation,
       request.transport,
     );
+    const invokeProvider = async (
+      content: ResolvedContent,
+    ): Promise<string> => {
+      if (content.mode === "multi-file") {
+        if (typeof provider.generateMultiFileSummary !== "function") {
+          throw new Error(
+            `Provider ${endpoint.providerType} does not support multi-file generation`,
+          );
+        }
+        return provider.generateMultiFileSummary(
+          content.files,
+          prompt,
+          options,
+          request.onProgress,
+        );
+      }
+      return provider.generateSummary(
+        content.content,
+        content.isBase64,
+        prompt,
+        options,
+        request.onProgress,
+      );
+    };
+
     let text: string;
-    if (resolved.mode === "multi-file") {
-      if (typeof provider.generateMultiFileSummary !== "function") {
-        throw new Error(
-          `Provider ${endpoint.providerType} does not support multi-file generation`,
-        );
+    try {
+      text = await invokeProvider(resolved);
+    } catch (error: unknown) {
+      if (isAbortError(error, options.abortSignal)) {
+        throw normalizeAbortError(error, options.abortSignal);
       }
-      try {
-        text = await provider.generateMultiFileSummary(
-          resolved.files,
-          prompt,
-          options,
-          request.onProgress,
-        );
-      } catch (error: unknown) {
-        if (isAbortError(error, options.abortSignal)) {
-          throw normalizeAbortError(error, options.abortSignal);
+      if (
+        isPayloadTooLargeFailure(error) &&
+        this.hasInlinePdfContent(resolved)
+      ) {
+        try {
+          const fallback = await this.resolveTextFallbackAfterProviderRejection(
+            provider,
+            request.content,
+            warnings,
+            true,
+            endpoint,
+          );
+          if (fallback) {
+            resolved = fallback;
+            text = await invokeProvider(resolved);
+          } else {
+            throw error;
+          }
+        } catch (fallbackError: unknown) {
+          if (isAbortError(fallbackError, options.abortSignal)) {
+            throw normalizeAbortError(fallbackError, options.abortSignal);
+          }
+          throw this.toApiCallError(endpoint, fallbackError);
         }
-        throw this.toApiCallError(endpoint, error);
-      }
-    } else {
-      try {
-        text = await provider.generateSummary(
-          resolved.content,
-          resolved.isBase64,
-          prompt,
-          options,
-          request.onProgress,
-        );
-      } catch (error: unknown) {
-        if (isAbortError(error, options.abortSignal)) {
-          throw normalizeAbortError(error, options.abortSignal);
-        }
+      } else {
         throw this.toApiCallError(endpoint, error);
       }
     }
@@ -652,11 +915,16 @@ export class LLMService {
     prompt: string,
   ): Promise<LLMResponse> {
     const useRetry = request.transport?.retry ?? true;
-    const maxAttempts = useRetry ? LLMEndpointManager.getMaxAttemptCount() : 1;
+    const maxAttempts = useRetry
+      ? Math.min(LLMEndpointManager.getMaxAttemptCount(), MAX_API_ATTEMPTS)
+      : 1;
     let lastError: Error | null = null;
+    let attempts = 0;
+    const errors: Error[] = [];
 
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    while (attempts < maxAttempts) {
       throwIfAborted(request.transport?.abortSignal);
+      attempts++;
       try {
         return await this.generateOnceWithEndpoint(endpoint, request, prompt);
       } catch (error: unknown) {
@@ -664,43 +932,90 @@ export class LLMService {
           throw normalizeAbortError(error, request.transport?.abortSignal);
         }
         lastError = error instanceof Error ? error : new Error(String(error));
-        ztoolkit.log(
-          `[LLMService] API failed via ${endpoint.name} (${attempt + 1}/${maxAttempts}): ${lastError.message}`,
+        errors.push(lastError);
+        logLLMService(
+          `[LLMService] API failed via ${endpoint.name} (${attempts}/${maxAttempts}): ${lastError.message}`,
+        );
+        if (!this.canRetryFailure(lastError, attempts, maxAttempts, errors)) {
+          break;
+        }
+        await this.waitBeforeRetry(
+          attempts,
+          lastError,
+          request.transport?.abortSignal,
         );
       }
     }
 
-    throw new LLMApiExhaustedError(maxAttempts, lastError || undefined);
+    throw new LLMApiExhaustedError(attempts, lastError || undefined, errors);
   }
 
   private static async chatWithEndpointRouting(
     request: LLMChatRequest,
     route: ReturnType<typeof LLMEndpointManager.prepareRoute>,
+    trackRoundRobinAttempts: boolean = true,
   ): Promise<LLMResponse> {
     const useRetry = request.transport?.retry ?? true;
-    const maxRetries = useRetry ? route.maxAttempts : 1;
+    const maxRetries = useRetry
+      ? Math.min(Math.max(route.maxAttempts, 1), MAX_API_ATTEMPTS)
+      : 1;
     let lastError: Error | null = null;
+    let attempts = 0;
+    let cursor = 0;
+    const errors: Error[] = [];
+    const terminalEndpoints = new Set<string>();
 
-    for (let attempt = 0; attempt < maxRetries; attempt++) {
+    while (attempts < maxRetries) {
       throwIfAborted(request.transport?.abortSignal);
-      const endpoint = route.endpoints[attempt % route.endpoints.length];
+      let endpoint: LLMEndpoint | undefined;
+      for (let checked = 0; checked < route.endpoints.length; checked++) {
+        const candidate = route.endpoints[cursor % route.endpoints.length];
+        cursor++;
+        if (!terminalEndpoints.has(candidate.id)) {
+          endpoint = candidate;
+          break;
+        }
+      }
+      if (!endpoint) break;
+      attempts++;
       try {
         const response = await this.chatOnceWithEndpoint(endpoint, request);
-        LLMEndpointManager.markEndpointAttempted(endpoint.id);
+        if (trackRoundRobinAttempts) {
+          LLMEndpointManager.markEndpointAttempted(endpoint.id);
+        }
         return response;
       } catch (error: unknown) {
         if (isAbortError(error, request.transport?.abortSignal)) {
           throw normalizeAbortError(error, request.transport?.abortSignal);
         }
-        LLMEndpointManager.markEndpointAttempted(endpoint.id);
+        if (trackRoundRobinAttempts) {
+          LLMEndpointManager.markEndpointAttempted(endpoint.id);
+        }
         lastError = error instanceof Error ? error : new Error(String(error));
-        ztoolkit.log(
-          `[LLMService] Chat API failed via ${endpoint.name} (${attempt + 1}/${maxRetries}): ${lastError.message}`,
+        errors.push(lastError);
+        logLLMService(
+          `[LLMService] Chat API failed via ${endpoint.name} (${attempts}/${maxRetries}): ${lastError.message}`,
         );
+        const failure = classifyRequestFailure(lastError);
+        if (!failure.retryable) terminalEndpoints.add(endpoint.id);
+        const hasCandidate = route.endpoints.some(
+          (candidate) => !terminalEndpoints.has(candidate.id),
+        );
+        if (!hasCandidate) break;
+        if (failure.retryable) {
+          if (!this.canRetryFailure(lastError, attempts, maxRetries, errors)) {
+            break;
+          }
+          await this.waitBeforeRetry(
+            attempts,
+            lastError,
+            request.transport?.abortSignal,
+          );
+        }
       }
     }
 
-    throw new LLMApiExhaustedError(maxRetries, lastError || undefined);
+    throw new LLMApiExhaustedError(attempts, lastError || undefined, errors);
   }
 
   private static async chatOnceWithEndpoint(
@@ -710,13 +1025,25 @@ export class LLMService {
     const provider = this.getProviderForEndpoint(endpoint);
     const warnings: string[] = [];
     throwIfAborted(request.transport?.abortSignal);
-    const resolved = await this.resolveContent(
-      provider,
-      request.content,
-      warnings,
-      false,
-      endpoint,
-    );
+    const conversationText = request.conversation
+      .map((message) => `${message.role}: ${message.content}`)
+      .join("\n");
+    let resolved: ResolvedContent;
+    try {
+      resolved = await this.resolveContentForRequest(
+        provider,
+        request.content,
+        warnings,
+        false,
+        endpoint,
+        conversationText,
+      );
+    } catch (error: unknown) {
+      if (isAbortError(error, request.transport?.abortSignal)) {
+        throw normalizeAbortError(error, request.transport?.abortSignal);
+      }
+      throw this.toApiCallError(endpoint, error);
+    }
     throwIfAborted(request.transport?.abortSignal);
     if (resolved.mode !== "single") {
       throw new Error("Chat requests do not support multi-file input.");
@@ -726,20 +1053,43 @@ export class LLMService {
       request.generation,
       request.transport,
     );
-    let text: string;
-    try {
-      text = await provider.chat(
-        resolved.content,
-        resolved.isBase64,
+    const invokeProvider = (content: ResolvedSingleContent) =>
+      provider.chat(
+        content.content,
+        content.isBase64,
         request.conversation,
         options,
         request.onProgress,
       );
+
+    let text: string;
+    try {
+      text = await invokeProvider(resolved);
     } catch (error: unknown) {
       if (isAbortError(error, options.abortSignal)) {
         throw normalizeAbortError(error, options.abortSignal);
       }
-      throw this.toApiCallError(endpoint, error);
+      if (isPayloadTooLargeFailure(error) && resolved.isBase64) {
+        try {
+          const fallback = await this.resolveTextFallbackAfterProviderRejection(
+            provider,
+            request.content,
+            warnings,
+            false,
+            endpoint,
+          );
+          if (!fallback || fallback.mode !== "single") throw error;
+          resolved = fallback;
+          text = await invokeProvider(resolved);
+        } catch (fallbackError: unknown) {
+          if (isAbortError(fallbackError, options.abortSignal)) {
+            throw normalizeAbortError(fallbackError, options.abortSignal);
+          }
+          throw this.toApiCallError(endpoint, fallbackError);
+        }
+      } else {
+        throw this.toApiCallError(endpoint, error);
+      }
     }
     return this.toResponse(
       text,
@@ -755,11 +1105,16 @@ export class LLMService {
     request: LLMChatRequest,
   ): Promise<LLMResponse> {
     const useRetry = request.transport?.retry ?? true;
-    const maxAttempts = useRetry ? LLMEndpointManager.getMaxAttemptCount() : 1;
+    const maxAttempts = useRetry
+      ? Math.min(LLMEndpointManager.getMaxAttemptCount(), MAX_API_ATTEMPTS)
+      : 1;
     let lastError: Error | null = null;
+    let attempts = 0;
+    const errors: Error[] = [];
 
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    while (attempts < maxAttempts) {
       throwIfAborted(request.transport?.abortSignal);
+      attempts++;
       try {
         return await this.chatOnceWithEndpoint(endpoint, request);
       } catch (error: unknown) {
@@ -767,13 +1122,22 @@ export class LLMService {
           throw normalizeAbortError(error, request.transport?.abortSignal);
         }
         lastError = error instanceof Error ? error : new Error(String(error));
-        ztoolkit.log(
-          `[LLMService] Chat API failed via ${endpoint.name} (${attempt + 1}/${maxAttempts}): ${lastError.message}`,
+        errors.push(lastError);
+        logLLMService(
+          `[LLMService] Chat API failed via ${endpoint.name} (${attempts}/${maxAttempts}): ${lastError.message}`,
+        );
+        if (!this.canRetryFailure(lastError, attempts, maxAttempts, errors)) {
+          break;
+        }
+        await this.waitBeforeRetry(
+          attempts,
+          lastError,
+          request.transport?.abortSignal,
         );
       }
     }
 
-    throw new LLMApiExhaustedError(maxAttempts, lastError || undefined);
+    throw new LLMApiExhaustedError(attempts, lastError || undefined, errors);
   }
 
   private static toApiCallError(
@@ -835,7 +1199,7 @@ export class LLMService {
           throw normalizeAbortError(error, request.transport?.abortSignal);
         }
         lastError = error instanceof Error ? error : new Error(String(error));
-        ztoolkit.log(
+        logLLMService(
           `[LLMService] API 调用失败 (尝试 ${attempt + 1}/${maxRetries}): ${lastError.message}`,
         );
         if (!useKeyRotation) break;
@@ -845,6 +1209,264 @@ export class LLMService {
     }
 
     throw lastError || new Error("所有 API 密钥均已耗尽");
+  }
+
+  private static getContentFallbackKey(
+    input: LLMContentInput,
+    endpoint?: LLMEndpoint,
+  ): string | null {
+    const endpointKey = endpoint?.id || endpoint?.providerType || "default";
+    if (input.kind === "zotero-item") {
+      return `${endpointKey}:item:${input.item.id}`;
+    }
+    if (input.kind === "pdf-attachment") {
+      return `${endpointKey}:attachment:${input.attachment.id}`;
+    }
+    if (input.kind === "pdf-files") {
+      const files = input.files
+        .map((file) => file.filePath || file.displayName)
+        .join("|");
+      return `${endpointKey}:files:${files}`;
+    }
+    if (input.kind === "legacy" && input.fallbackItem) {
+      return `${endpointKey}:legacy-item:${input.fallbackItem.id}`;
+    }
+    return null;
+  }
+
+  private static rememberTextFallback(
+    input: LLMContentInput,
+    endpoint?: LLMEndpoint,
+  ): void {
+    const key = this.getContentFallbackKey(input, endpoint);
+    if (!key) return;
+    if (this.forcedTextContentKeys.size >= 512) {
+      const oldest = this.forcedTextContentKeys.values().next().value;
+      if (oldest) {
+        this.forcedTextContentKeys.delete(oldest);
+      }
+    }
+    this.forcedTextContentKeys.add(key);
+  }
+
+  private static shouldForceTextFallback(
+    input: LLMContentInput,
+    endpoint?: LLMEndpoint,
+  ): boolean {
+    const key = this.getContentFallbackKey(input, endpoint);
+    return !!key && this.forcedTextContentKeys.has(key);
+  }
+
+  private static canResolveContentAsText(input: LLMContentInput): boolean {
+    if (input.kind === "legacy") return !!input.fallbackItem;
+    if (input.kind === "zotero-item" || input.kind === "pdf-attachment") {
+      return true;
+    }
+    if (input.kind === "pdf-files") {
+      return input.files.some((file) => !!file.textContent?.trim());
+    }
+    return false;
+  }
+
+  private static hasInlinePdfContent(resolved: ResolvedContent): boolean {
+    if (resolved.mode === "single") return resolved.isBase64;
+    return resolved.files.some((file) => !!file.base64Content);
+  }
+
+  private static estimateResolvedRequestBytes(
+    resolved: ResolvedContent,
+    requestText: string,
+  ): number {
+    let inlineBytes = 0;
+    if (resolved.mode === "single") {
+      if (resolved.isBase64) inlineBytes = resolved.content.length;
+    } else {
+      inlineBytes = resolved.files.reduce(
+        (total, file) => total + (file.base64Content?.length || 0),
+        0,
+      );
+    }
+    if (inlineBytes === 0) return 0;
+    return estimateInlinePdfRequestBytes(inlineBytes, requestText);
+  }
+
+  private static async estimateInputInlinePdfBytes(
+    provider: ILlmProvider,
+    input: LLMContentInput,
+    allowMultiFile: boolean,
+    endpoint: LLMEndpoint,
+    requestText: string,
+  ): Promise<number> {
+    if (input.kind === "text") return 0;
+    if (input.kind === "legacy") {
+      return input.isBase64
+        ? estimateInlinePdfRequestBytes(input.content.length, requestText)
+        : 0;
+    }
+
+    const capabilities = this.getProviderCapabilities(provider);
+    const policy = this.choosePolicy(input.policy, capabilities, endpoint);
+    if (policy !== "pdf-base64") return 0;
+
+    let encodedBytes = 0;
+    if (input.kind === "pdf-attachment") {
+      encodedBytes = estimateBase64Length(
+        await PDFExtractor.getPdfAttachmentFileSizeBytes(input.attachment),
+      );
+    } else if (input.kind === "pdf-files") {
+      const limit = Math.min(
+        input.maxAttachments || Infinity,
+        allowMultiFile ? capabilities.maxPdfFiles : 1,
+      );
+      const sizes = await Promise.all(
+        input.files
+          .slice(0, limit)
+          .map(async (file) =>
+            file.base64Content
+              ? file.base64Content.length
+              : estimateBase64Length(
+                  await PDFExtractor.getFileSizeBytes(file.filePath),
+                ),
+          ),
+      );
+      encodedBytes = sizes.reduce((total, size) => total + size, 0);
+    } else {
+      const attachmentMode =
+        input.attachmentMode ||
+        (getPref("pdfAttachmentMode") as string) ||
+        "default";
+      const allPdfs = await PDFExtractor.getAllPdfAttachments(input.item);
+      const maxAttachments = Math.max(input.maxAttachments || Infinity, 1);
+      const selected =
+        allowMultiFile && attachmentMode === "all"
+          ? allPdfs.slice(0, Math.min(maxAttachments, capabilities.maxPdfFiles))
+          : allPdfs.slice(0, 1);
+      const sizes = await Promise.all(
+        selected.map((attachment) =>
+          PDFExtractor.getPdfAttachmentFileSizeBytes(attachment),
+        ),
+      );
+      encodedBytes = sizes.reduce(
+        (total, size) => total + estimateBase64Length(size),
+        0,
+      );
+    }
+
+    return encodedBytes > 0
+      ? estimateInlinePdfRequestBytes(encodedBytes, requestText)
+      : 0;
+  }
+
+  private static async resolveContentForRequest(
+    provider: ILlmProvider,
+    input: LLMContentInput,
+    warnings: string[],
+    allowMultiFile: boolean,
+    endpoint: LLMEndpoint,
+    requestText: string,
+  ): Promise<ResolvedContent> {
+    const forceText = this.shouldForceTextFallback(input, endpoint);
+    const preflightBytes = forceText
+      ? 0
+      : await this.estimateInputInlinePdfBytes(
+          provider,
+          input,
+          allowMultiFile,
+          endpoint,
+          requestText,
+        );
+    if (preflightBytes > SAFE_INLINE_REQUEST_BYTES) {
+      if (!this.canResolveContentAsText(input)) {
+        throw new LLMRequestTooLargeError(
+          preflightBytes,
+          SAFE_INLINE_REQUEST_BYTES,
+        );
+      }
+      this.rememberTextFallback(input, endpoint);
+      warnings.push(
+        "PDF payload was too large for a reliable request and was automatically converted to extracted text before upload.",
+      );
+      try {
+        return await this.resolveContent(
+          provider,
+          input,
+          warnings,
+          allowMultiFile,
+          endpoint,
+          "text",
+        );
+      } catch (error: unknown) {
+        throw new LLMRequestTooLargeError(
+          preflightBytes,
+          SAFE_INLINE_REQUEST_BYTES,
+          error instanceof Error ? error : new Error(String(error)),
+        );
+      }
+    }
+    const resolved = await this.resolveContent(
+      provider,
+      input,
+      warnings,
+      allowMultiFile,
+      endpoint,
+      forceText ? "text" : undefined,
+    );
+    if (forceText || !this.hasInlinePdfContent(resolved)) return resolved;
+
+    const estimatedBytes = this.estimateResolvedRequestBytes(
+      resolved,
+      requestText,
+    );
+    if (estimatedBytes <= SAFE_INLINE_REQUEST_BYTES) return resolved;
+    if (!this.canResolveContentAsText(input)) {
+      throw new LLMRequestTooLargeError(
+        estimatedBytes,
+        SAFE_INLINE_REQUEST_BYTES,
+      );
+    }
+
+    this.rememberTextFallback(input, endpoint);
+    warnings.push(
+      "PDF payload was too large for a reliable request and was automatically converted to extracted text.",
+    );
+    try {
+      return await this.resolveContent(
+        provider,
+        input,
+        warnings,
+        allowMultiFile,
+        endpoint,
+        "text",
+      );
+    } catch (error: unknown) {
+      throw new LLMRequestTooLargeError(
+        estimatedBytes,
+        SAFE_INLINE_REQUEST_BYTES,
+        error instanceof Error ? error : new Error(String(error)),
+      );
+    }
+  }
+
+  private static async resolveTextFallbackAfterProviderRejection(
+    provider: ILlmProvider,
+    input: LLMContentInput,
+    warnings: string[],
+    allowMultiFile: boolean,
+    endpoint: LLMEndpoint,
+  ): Promise<ResolvedContent | null> {
+    if (!this.canResolveContentAsText(input)) return null;
+    this.rememberTextFallback(input, endpoint);
+    warnings.push(
+      "The provider rejected the PDF request size; AI Butler retried this request with extracted text.",
+    );
+    return await this.resolveContent(
+      provider,
+      input,
+      warnings,
+      allowMultiFile,
+      endpoint,
+      "text",
+    );
   }
 
   private static toResponse(
@@ -887,12 +1509,26 @@ export class LLMService {
     warnings: string[],
     allowMultiFile: boolean,
     endpoint?: LLMEndpoint,
+    policyOverride?: LLMContentPolicy,
   ): Promise<ResolvedContent> {
     if (input.kind === "text") {
       return { mode: "single", content: input.text, isBase64: false, warnings };
     }
 
     if (input.kind === "legacy") {
+      if (policyOverride === "text" && input.fallbackItem) {
+        const text = await PDFExtractor.extractTextFromItem(
+          input.fallbackItem,
+          "text",
+        );
+        const normalized = this.normalizeText(text);
+        return {
+          mode: "single",
+          content: normalized,
+          isBase64: false,
+          warnings,
+        };
+      }
       return {
         mode: "single",
         content: input.isBase64
@@ -904,7 +1540,9 @@ export class LLMService {
     }
 
     const capabilities = this.getProviderCapabilities(provider);
-    const policy = this.choosePolicy(input.policy, capabilities, endpoint);
+    const policy = policyOverride
+      ? this.choosePolicy(policyOverride, capabilities, endpoint)
+      : this.choosePolicy(input.policy, capabilities, endpoint);
 
     if (input.kind === "zotero-item") {
       return this.resolveZoteroItemContent(
@@ -933,7 +1571,7 @@ export class LLMService {
 
   private static choosePolicy(
     requestedPolicy: LLMContentPolicy | undefined,
-    _capabilities: LLMProviderCapabilities,
+    capabilities: LLMProviderCapabilities,
     endpoint?: LLMEndpoint,
   ): LLMContentPolicy {
     const rawMode = (
@@ -944,9 +1582,10 @@ export class LLMService {
     let policy: LLMContentPolicy;
     if (rawMode === "text") policy = "text";
     else if (rawMode === "mineru") policy = "mineru";
-    else if (rawMode === "auto") policy = "pdf-base64";
-    else {
-      policy = "pdf-base64";
+    else if (rawMode === "auto") {
+      policy = capabilities.supportsPdfBase64 ? "pdf-base64" : "text";
+    } else {
+      policy = capabilities.supportsPdfBase64 ? "pdf-base64" : "text";
     }
 
     return policy;

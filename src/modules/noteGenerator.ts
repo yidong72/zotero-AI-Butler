@@ -226,10 +226,13 @@ export class NoteGenerator {
       throwIfAborted(options?.abortSignal);
       progressCallback?.("正在处理PDF...", 10);
 
+      // 读取当前主模型的 PDF 处理模式和附件选择模式
+      const prefMode = LLMService.getEffectivePdfProcessMode();
+
       // 检查 PDF 文件大小限制
       const enableSizeLimit =
         (getPref("enablePdfSizeLimit" as any) as boolean) ?? false;
-      if (enableSizeLimit) {
+      if (enableSizeLimit && prefMode === "base64") {
         const maxPdfSizeMB = parseFloat(
           (getPref("maxPdfSizeMB" as any) as string) || "50",
         );
@@ -241,8 +244,6 @@ export class NoteGenerator {
         }
       }
 
-      // 读取当前主模型的 PDF 处理模式和附件选择模式
-      const prefMode = LLMService.getEffectivePdfProcessMode();
       const pdfAttachmentMode =
         (getPref("pdfAttachmentMode" as any) as string) || "default";
       if (
@@ -300,7 +301,8 @@ export class NoteGenerator {
         }
       }
 
-      // AI 精读会复用同一份 PDF 内容；单次总结交给 LLMService 统一解析，避免 MinerU 重复处理。
+      // AI 精读会多轮复用同一份内容。大文件在 Base64 分配前回退文本；
+      // 其余 PDF 只编码一次，避免每个章节重复读取和编码。
       if (summaryMode !== "single" && !useMultiModelSummary) {
         const extracted = await this.extractPdfContentForMode(item, prefMode);
         pdfContent = extracted.content;
@@ -546,19 +548,7 @@ export class NoteGenerator {
     item: Zotero.Item,
     mode: LLMPdfProcessMode,
   ): Promise<{ content: string; isBase64: boolean }> {
-    if (mode === "base64") {
-      return {
-        content: await PDFExtractor.extractBase64FromItem(item),
-        isBase64: true,
-      };
-    }
-
-    const fullText = await PDFExtractor.extractTextFromItem(item, mode);
-    const cleanedText = PDFExtractor.cleanText(fullText);
-    return {
-      content: PDFExtractor.truncateText(cleanedText),
-      isBase64: false,
-    };
+    return LLMService.prepareReusableItemContent(item, mode);
   }
 
   private static async generateMultiModelSummaryContent(params: {
@@ -1185,6 +1175,7 @@ export class NoteGenerator {
       params.progressCallback?.("正在解析章节结构...", 45);
       const planningResponse = await this.callDeepReadChat({
         session,
+        item: params.item,
         pdfContent: params.pdfContent,
         isBase64: params.isBase64,
         conversation: [{ role: "user", content: planningPrompt }],
@@ -1375,6 +1366,7 @@ export class NoteGenerator {
         // 仅用户主动取消才中断；其余错误记为该章节失败（可再次重试）。
         if (params.abortSignal?.aborted === true) throw error;
         await updateSlot(slot, error?.message || String(error), "error");
+        if (this.isDeepReadTransportFailure(error)) throw error;
       }
     });
 
@@ -1434,6 +1426,7 @@ export class NoteGenerator {
         // \u4ec5\u7528\u6237\u4e3b\u52a8\u53d6\u6d88\u624d\u4e2d\u65ad\u6574\u8f6e\uff1b\u5176\u4f59\u9519\u8bef\u8bb0\u4e3a\u8be5\u7ae0\u8282\u5931\u8d25\u5e76\u7ee7\u7eed\uff0c\u7a0d\u540e\u81ea\u52a8\u91cd\u8bd5\u3002
         if (params.abortSignal?.aborted === true) throw error;
         await updateSlot(slot, error?.message || String(error), "error");
+        if (this.isDeepReadTransportFailure(error)) throw error;
       }
     };
 
@@ -1500,6 +1493,7 @@ export class NoteGenerator {
           // \u4ec5\u7528\u6237\u4e3b\u52a8\u53d6\u6d88\u624d\u4e2d\u65ad\u6574\u8f6e\uff1b\u5176\u4f59\u9519\u8bef\u8bb0\u4e3a\u8be5\u7ae0\u8282\u5931\u8d25\u5e76\u7ee7\u7eed\uff0c\u7a0d\u540e\u81ea\u52a8\u91cd\u8bd5\u3002
           if (params.abortSignal?.aborted === true) throw error;
           await updateSlot(slot, error?.message || String(error), "error");
+          if (this.isDeepReadTransportFailure(error)) throw error;
         }
       }
 
@@ -1527,13 +1521,13 @@ export class NoteGenerator {
               runIndependentSlot(slot, batchStartIndex + offset, false),
             ),
           );
-          // \u4ec5\u5728\u7528\u6237\u4e3b\u52a8\u53d6\u6d88\u65f6\u4e2d\u65ad\u6574\u8f6e\uff08\u7ae0\u8282\u7ea7\u5931\u8d25\u5df2\u5728\u5185\u90e8\u6d88\u5316\u5e76\u7ee7\u7eed\uff09\u3002
-          if (params.abortSignal?.aborted === true) {
-            const rejected = results.find(
-              (result) => result.status === "rejected",
-            );
-            if (rejected?.status === "rejected") throw rejected.reason;
-          }
+          // runIndependentSlot only rejects for cancellation or a systemic
+          // transport failure. Stop this pass so the persisted queue can retry
+          // later instead of multiplying the same outage across every slot.
+          const rejected = results.find(
+            (result) => result.status === "rejected",
+          );
+          if (rejected?.status === "rejected") throw rejected.reason;
         }
       }
     };
@@ -1681,18 +1675,13 @@ export class NoteGenerator {
     abortSignal?: LLMAbortSignal;
     onProgress?: (chunk: string) => void;
   }): Promise<LLMResponse> {
-    const content = params.item
-      ? {
-          kind: "zotero-item" as const,
-          item: params.item,
-          attachmentMode: "default" as const,
-        }
-      : {
-          kind: "legacy" as const,
-          content: params.pdfContent,
-          isBase64: params.isBase64,
-          policy: params.isBase64 ? ("pdf-base64" as const) : ("text" as const),
-        };
+    const content = {
+      kind: "legacy" as const,
+      content: params.pdfContent,
+      isBase64: params.isBase64,
+      policy: params.isBase64 ? ("pdf-base64" as const) : ("text" as const),
+      fallbackItem: params.item,
+    };
     let conversation = params.conversation;
     let response = await this.chatWithDeepReadSession(params.session, {
       content,
@@ -1701,6 +1690,7 @@ export class NoteGenerator {
       onProgress: params.onProgress,
     });
     let text = response.text;
+    let previousTurnText = response.text;
 
     for (
       let attempt = 0;
@@ -1712,7 +1702,7 @@ export class NoteGenerator {
         "The previous answer appears to be truncated. Continue exactly from where it stopped. Do not repeat earlier content.";
       conversation = [
         ...conversation,
-        { role: "assistant", content: response.text },
+        { role: "assistant", content: previousTurnText },
         { role: "user", content: continuePrompt },
       ];
       const continuation = await this.chatWithDeepReadSession(params.session, {
@@ -1721,11 +1711,31 @@ export class NoteGenerator {
         transport: { abortSignal: params.abortSignal },
         onProgress: params.onProgress,
       });
+      previousTurnText = continuation.text;
       response = { ...continuation, text: text + "\n\n" + continuation.text };
       text = response.text;
     }
 
     return response;
+  }
+
+  private static isDeepReadTransportFailure(error: unknown): boolean {
+    const value = error as
+      | {
+          name?: string;
+          failureKind?: string;
+          endpointId?: string;
+          providerId?: string;
+        }
+      | undefined;
+    return (
+      value?.name === "LLMApiCallError" ||
+      value?.name === "LLMApiExhaustedError" ||
+      value?.name === "LLMRequestTooLargeError" ||
+      !!value?.failureKind ||
+      !!value?.endpointId ||
+      !!value?.providerId
+    );
   }
 
   private static async chatWithDeepReadSession(
@@ -1737,25 +1747,22 @@ export class NoteGenerator {
     }
 
     const fixedEndpointId = session.endpointId;
-    try {
-      return await LLMService.chatWithEndpoint(fixedEndpointId, chatRequest);
-    } catch (error) {
-      if (
-        !session.allowFallback ||
-        isAbortError(error, chatRequest.transport?.abortSignal)
-      ) {
-        throw error;
-      }
-
-      const response = await LLMService.chat(chatRequest);
-      if (response.endpointId) {
-        session.endpointId = response.endpointId;
-        ztoolkit.log(
-          `[AI-Butler] Deep-read session endpoint ${fixedEndpointId} unavailable; fell back and pinned to ${response.endpointId}`,
-        );
-      }
-      return response;
+    const response = await LLMService.chatWithPreferredEndpoint(
+      fixedEndpointId,
+      chatRequest,
+      session.allowFallback,
+    );
+    if (
+      response.endpointId &&
+      response.endpointId !== fixedEndpointId &&
+      session.allowFallback
+    ) {
+      session.endpointId = response.endpointId;
+      ztoolkit.log(
+        `[AI-Butler] Deep-read session endpoint ${fixedEndpointId} unavailable; fell back and pinned to ${response.endpointId}`,
+      );
     }
+    return response;
   }
 
   private static isLikelyTruncated(response: LLMResponse): boolean {

@@ -192,6 +192,29 @@ export class PDFExtractor {
     }
   }
 
+  public static async getFileSizeBytes(filePath: string): Promise<number> {
+    if (!filePath) return 0;
+    try {
+      const fileInfo = await IOUtils.stat(filePath);
+      return Math.max(0, Number(fileInfo.size) || 0);
+    } catch (error) {
+      ztoolkit.log("[PDFExtractor] 获取文件大小时出错:", error);
+      return 0;
+    }
+  }
+
+  public static async getPdfAttachmentFileSizeBytes(
+    attachment: Zotero.Item,
+  ): Promise<number> {
+    try {
+      const filePath = await attachment.getFilePathAsync();
+      return filePath ? await this.getFileSizeBytes(filePath) : 0;
+    } catch (error) {
+      ztoolkit.log("[PDFExtractor] 获取 PDF 附件大小时出错:", error);
+      return 0;
+    }
+  }
+
   /**
    * 从 Zotero 条目中提取 PDF 全文
    *

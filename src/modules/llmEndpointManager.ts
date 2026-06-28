@@ -311,7 +311,7 @@ export class LLMEndpointManager {
   static getMaxAttemptCount(): number {
     const raw = String(getPref("maxApiSwitchCount" as any) || "3");
     const parsed = parseInt(raw, 10);
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : 3;
+    return Math.min(5, Number.isFinite(parsed) && parsed > 0 ? parsed : 3);
   }
 
   static prepareRoute(): LLMEndpointRoute {

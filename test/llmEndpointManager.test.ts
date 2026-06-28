@@ -217,6 +217,9 @@ describe("LLMEndpointManager", function () {
       "a",
       "c",
     ]);
+
+    Zotero.Prefs.set(prefName("maxApiSwitchCount"), "99", true);
+    expect(LLMEndpointManager.prepareRoute().maxAttempts).to.equal(5);
   });
 
   it("advances round-robin cursor after each attempted endpoint", function () {

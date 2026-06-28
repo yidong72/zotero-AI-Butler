@@ -3103,19 +3103,17 @@ function renderChatArea(
     // 如果尚未加载 PDF 内容，则加载
     if (item) {
       try {
-        const { PDFExtractor } = await import("./pdfExtractor");
         const { default: LLMService } = await import("./llmService");
         const pdfMode = LLMService.getEffectivePdfProcessMode();
-        const isBase64 = pdfMode === "base64";
 
         messagesArea.innerHTML = `<div style="color: #999; text-align: center; padding: 10px;">📄 正在加载论文内容...</div>`;
 
-        let pdfContent = "";
-        if (isBase64) {
-          pdfContent = await PDFExtractor.extractBase64FromItem(item);
-        } else {
-          pdfContent = await PDFExtractor.extractTextFromItem(item, pdfMode);
-        }
+        const prepared = await LLMService.prepareReusableItemContent(
+          item,
+          pdfMode,
+        );
+        const pdfContent = prepared.content;
+        const isBase64 = prepared.isBase64;
 
         if (pdfContent) {
           currentChatState.pdfContent = pdfContent;
@@ -3316,6 +3314,7 @@ function renderChatArea(
           content: currentChatState.pdfContent,
           isBase64: currentChatState.isBase64,
           policy: currentChatState.isBase64 ? "pdf-base64" : "text",
+          fallbackItem: item,
         },
         conversation: conversationHistory,
         transport: {

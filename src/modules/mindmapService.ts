@@ -23,6 +23,14 @@ import { getPref } from "../utils/prefs";
 import { getDefaultMindmapPrompt, type PromptLang } from "../utils/prompts";
 import { ENGLISH_NOTE_TAG, isEnglishNoteVariant } from "./aiNoteClassifier";
 
+function logMindmap(...args: Parameters<ZToolkit["log"]>): void {
+  try {
+    if (typeof ztoolkit !== "undefined") ztoolkit.log(...args);
+  } catch {
+    // Logging is best-effort.
+  }
+}
+
 /**
  * 工作流阶段类型
  */
@@ -68,7 +76,10 @@ export class MindmapService {
       // 检查 PDF 文件大小限制
       const enableSizeLimit =
         (getPref("enablePdfSizeLimit" as any) as boolean) ?? false;
-      if (enableSizeLimit) {
+      if (
+        enableSizeLimit &&
+        LLMService.getEffectivePdfProcessMode() === "base64"
+      ) {
         const maxPdfSizeMB = parseFloat(
           (getPref("maxPdfSizeMB" as any) as string) || "50",
         );
@@ -91,7 +102,7 @@ export class MindmapService {
       );
       const mindmapMarkdown = mindmapResult.markdown;
 
-      ztoolkit.log(
+      logMindmap(
         `[AI-Butler] 思维导图生成完成，长度: ${mindmapMarkdown.length}`,
       );
 
@@ -111,7 +122,7 @@ export class MindmapService {
     } catch (error: any) {
       progressCallback?.("failed", `生成失败: ${error.message}`, 0);
 
-      ztoolkit.log("[AI-Butler] 思维导图生成失败:", error);
+      logMindmap("[AI-Butler] 思维导图生成失败:", error);
 
       throw error;
     }
@@ -169,7 +180,7 @@ export class MindmapService {
         false,
         prompt,
       );
-      ztoolkit.log(
+      logMindmap(
         "[AI-Butler] 思维导图内容格式异常:",
         trimmedContent.substring(0, 500),
       );
@@ -238,11 +249,9 @@ ${truncatedRequest}`;
     metadata?: LLMNoteMetadata | null,
     lang: PromptLang = "zh",
   ): Promise<Zotero.Item> {
-    // 查找并删除已有的同语言思维导图笔记（中英文版本互不覆盖）
+    // Reuse the same-language note so a failed save cannot delete the last
+    // valid mind map.
     const existingNote = await this.findExistingMindmapNote(item, lang);
-    if (existingNote) {
-      await existingNote.eraseTx();
-    }
 
     // 构建笔记标题（限制长度）
     const itemTitle = item.getField("title") as string;
@@ -270,19 +279,38 @@ ${truncatedRequest}`;
       ? LLMNoteMetadataService.wrapHtml(noteHtmlRaw, metadata)
       : noteHtmlRaw;
 
-    // 创建新笔记
-    const note = new Zotero.Item("note");
-    note.libraryID = item.libraryID;
-    note.parentID = item.id;
+    const note = existingNote || new Zotero.Item("note");
+    const previousHtml = existingNote
+      ? ((existingNote as any).getNote?.() as string) || ""
+      : null;
+    const previousTags = existingNote
+      ? existingNote
+          .getTags()
+          .map(({ tag, type }) => ({ tag, type: type ?? 0 }))
+      : null;
+    if (!existingNote) {
+      note.libraryID = item.libraryID;
+      note.parentID = item.id;
+    }
     note.setNote(noteHtml);
 
     // 添加标签 - 只使用 AI-Mindmap 标签，不添加 AI-Generated 避免与普通笔记混淆
     note.addTag("AI-Mindmap", 0);
     if (lang === "en") note.addTag(ENGLISH_NOTE_TAG);
 
-    await note.saveTx();
+    try {
+      await note.saveTx();
+    } catch (error) {
+      if (existingNote && previousHtml !== null) {
+        existingNote.setNote(previousHtml);
+        if (previousTags) existingNote.setTags(previousTags);
+      }
+      throw error;
+    }
 
-    ztoolkit.log(`[AI-Butler] 思维导图笔记已创建: ${noteTitle}`);
+    logMindmap(
+      `[AI-Butler] 思维导图笔记已${existingNote ? "更新" : "创建"}: ${noteTitle}`,
+    );
 
     return note;
   }

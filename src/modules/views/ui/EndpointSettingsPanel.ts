@@ -226,8 +226,12 @@ export class EndpointSettingsPanel {
       "3",
     );
     retryInput.min = "1";
+    retryInput.max = "5";
     retryInput.addEventListener("change", () => {
-      const value = Math.max(1, parseInt(retryInput.value || "3", 10) || 3);
+      const value = Math.min(
+        5,
+        Math.max(1, parseInt(retryInput.value || "3", 10) || 3),
+      );
       retryInput.value = String(value);
       setPref("maxApiSwitchCount" as any, String(value));
     });
@@ -239,7 +243,7 @@ export class EndpointSettingsPanel {
       createFormGroup(
         "最大 API 请求次数",
         retryInput,
-        "一次 AI 调用内最多发起的真实 API 请求数。达到上限后任务会直接失败，不再由任务队列继续重试同一个坏端点。",
+        "一次 AI 调用内最多发起 1-5 次真实请求。仅连接、超时、限流和服务端故障会退避重试；任务队列可在稍后继续恢复。",
       ),
     );
 

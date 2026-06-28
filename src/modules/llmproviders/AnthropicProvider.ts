@@ -146,19 +146,20 @@ export class AnthropicProvider implements ILlmProvider {
           xmlhttp.onprogress = (e: any) => {
             const status = e.target.status;
             if (status >= 400) {
+              const errorResponse = e.target.response;
               try {
-                const errorResponse = e.target.response;
                 const parsed = errorResponse ? JSON.parse(errorResponse) : null;
                 const err = parsed?.error || parsed || {};
-                const code = err?.type || `HTTP ${status}`;
+                const code = err?.type || err?.code || `HTTP ${status}`;
                 const msg = err?.message || "请求失败";
-                const errorMessage = `${code}: ${msg}`;
-                xmlhttp.abort();
-                throw new Error(errorMessage);
+                abortError = new Error(`${code}: ${msg}`);
               } catch {
-                xmlhttp.abort();
-                throw new Error(`HTTP ${status}: 请求失败`);
+                abortError = new Error(
+                  String(errorResponse || `HTTP ${status}: 请求失败`),
+                );
               }
+              xmlhttp.abort();
+              return;
             }
 
             try {
@@ -405,11 +406,11 @@ export class AnthropicProvider implements ILlmProvider {
           xmlhttp.onprogress = (e: any) => {
             const status = e.target.status;
             if (status >= 400) {
+              const errorResponse = e.target.response;
               try {
-                const errorResponse = e.target.response;
                 const parsed = errorResponse ? JSON.parse(errorResponse) : null;
                 const err = parsed?.error || parsed || {};
-                const code = err?.type || `HTTP ${status}`;
+                const code = err?.type || err?.code || `HTTP ${status}`;
                 const msg = err?.message || "请求失败";
                 const errorMessage = `${code}: ${msg}`;
                 abortError = new Error(errorMessage);
@@ -421,7 +422,9 @@ export class AnthropicProvider implements ILlmProvider {
                 });
                 xmlhttp.abort();
               } catch (parseErr) {
-                const errorMessage = `HTTP ${status}: 请求失败`;
+                const errorMessage = String(
+                  errorResponse || `HTTP ${status}: 请求失败`,
+                );
                 abortError = new Error(errorMessage);
                 ztoolkit.log("[AI-Butler] Anthropic HTTP error:", {
                   status,
@@ -802,16 +805,18 @@ export class AnthropicProvider implements ILlmProvider {
           xmlhttp.onprogress = (e: any) => {
             const status = e.target.status;
             if (status >= 400) {
+              const errorResponse = e.target.response;
               try {
-                const errorResponse = e.target.response;
                 const parsed = errorResponse ? JSON.parse(errorResponse) : null;
                 const err = parsed?.error || parsed || {};
-                const code = err?.type || `HTTP ${status}`;
+                const code = err?.type || err?.code || `HTTP ${status}`;
                 const msg = err?.message || "请求失败";
                 abortError = new Error(`${code}: ${msg}`);
                 xmlhttp.abort();
               } catch {
-                abortError = new Error(`HTTP ${status}: 请求失败`);
+                abortError = new Error(
+                  String(errorResponse || `HTTP ${status}: 请求失败`),
+                );
                 xmlhttp.abort();
               }
               return;

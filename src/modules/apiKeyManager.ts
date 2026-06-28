@@ -388,7 +388,7 @@ export class ApiKeyManager {
   static getMaxSwitchCount(): number {
     const raw = (getPref("maxApiSwitchCount" as any) as string) || "3";
     const val = parseInt(raw, 10);
-    return isNaN(val) || val < 1 ? 3 : val;
+    return Math.min(5, isNaN(val) || val < 1 ? 3 : val);
   }
 
   /**

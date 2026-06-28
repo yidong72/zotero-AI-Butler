@@ -5,6 +5,7 @@ import type {
   MultiRoundPromptTemplate,
   PromptLang,
 } from "../src/utils/prompts";
+import { hasRunnableDeepReadSlots } from "../src/modules/deepReadEngine";
 
 type DeepReadGeneratorInternals = {
   generateDeepReadContent(params: {
@@ -126,5 +127,64 @@ describe("NoteGenerator deep-read persistence", function () {
     expect(persistedHtml).to.include("Completed response 2");
     expect(persistedHtml).not.to.match(/(?:⏳|🔄).*?(?:等待生成|正在生成)/);
     expect(result.noteHtml).not.to.match(/(?:⏳|🔄).*?(?:等待生成|正在生成)/);
+  });
+
+  it("stops a pass after one systemic transport failure and keeps the note resumable", async function () {
+    const residualHtml = [
+      "<h1>AI 精读 - Paper</h1>",
+      "<h2>章节解析</h2>",
+      "<p>第1章：引言（Introduction）</p>",
+      "<h2>Chapter 1</h2>",
+      "<p>⏳ 等待生成...</p>",
+      "<h2>Limitations</h2>",
+      "<p>⏳ 等待生成...</p>",
+    ].join("\n");
+    let persistedHtml = residualHtml;
+    let pendingHtml = residualHtml;
+    let calls = 0;
+    const note = {
+      getNote: () => persistedHtml,
+      setNote: (html: string) => {
+        pendingHtml = html;
+      },
+      saveTx: async () => {
+        persistedHtml = pendingHtml;
+      },
+    } as unknown as Zotero.Item;
+    const transportError = Object.assign(
+      new Error("Request timed out after 300000 ms"),
+      {
+        name: "LLMApiExhaustedError",
+        failureKind: "timeout",
+        suppressTaskRetry: false,
+      },
+    );
+
+    internals.getActiveDeepReadTemplate = () => template;
+    internals.callDeepReadChat = async () => {
+      calls++;
+      throw transportError;
+    };
+
+    let caught: unknown;
+    try {
+      await internals.generateDeepReadContent({
+        item: { id: 2 } as Zotero.Item,
+        existing: note,
+        existingHtml: residualHtml,
+        policy: "skip",
+        pdfContent: "PDF",
+        isBase64: false,
+        itemTitle: "Paper",
+        promptLanguage: "zh",
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).to.equal(transportError);
+    expect(calls).to.equal(1);
+    expect(hasRunnableDeepReadSlots(persistedHtml)).to.equal(true);
+    expect(persistedHtml).to.include("Request timed out after 300000 ms");
   });
 });

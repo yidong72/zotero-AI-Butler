@@ -17,6 +17,14 @@
 import { ENGLISH_NOTE_TAG, isEnglishNoteVariant } from "./aiNoteClassifier";
 import type { PromptLang } from "../utils/prompts";
 
+function logImageNote(...args: Parameters<ZToolkit["log"]>): void {
+  try {
+    if (typeof ztoolkit !== "undefined") ztoolkit.log(...args);
+  } catch {
+    // Logging must not turn a successful note transaction into a failure.
+  }
+}
+
 /**
  * 一图总结笔记生成器类
  *
@@ -54,65 +62,117 @@ export class ImageNoteGenerator {
     // 检查是否已存在同语言的一图总结笔记（中英文版本互不覆盖）
     let note = await this.findExistingImageNote(item, lang);
     const isUpdate = !!note;
+    const previousHtml = note
+      ? ((note as any).getNote?.() as string) || ""
+      : null;
+    const previousTags = note
+      ? (
+          ((note as any).getTags?.() || []) as Array<{
+            tag: string;
+            type?: number;
+          }>
+        ).map(({ tag, type }) => ({ tag, type: type ?? 0 }))
+      : null;
+    let placeholderPersisted = false;
+    let attachment: Zotero.Item | null = null;
 
-    if (!note) {
-      // 创建新笔记（先设置临时内容）
-      note = new Zotero.Item("note");
-      note.libraryID = item.libraryID;
-      note.parentID = item.id;
-      note.setNote(
-        lang === "en"
-          ? "<p>Generating image summary...</p>"
-          : "<p>正在生成一图总结...</p>",
+    try {
+      if (!note) {
+        // Embedded images require a persisted parent note. Roll this placeholder
+        // back if any later stage fails.
+        note = new Zotero.Item("note");
+        note.libraryID = item.libraryID;
+        note.parentID = item.id;
+        note.setNote(
+          lang === "en"
+            ? "<p>Generating image summary...</p>"
+            : "<p>正在生成一图总结...</p>",
+        );
+        note.addTag(this.IMAGE_NOTE_TAG);
+        if (lang === "en") note.addTag(ENGLISH_NOTE_TAG);
+        await note.saveTx();
+        placeholderPersisted = true;
+        logImageNote(`[AI-Butler] 创建新的一图总结笔记: ${note.id}`);
+      } else {
+        note.addTag(this.IMAGE_NOTE_TAG);
+        if (lang === "en") note.addTag(ENGLISH_NOTE_TAG);
+      }
+
+      // 将 base64 转换为 Blob
+      const normalizedMimeType = this.normalizeImageMimeTypeForEmbedding(
+        imageBase64,
+        mimeType,
       );
-      note.addTag(this.IMAGE_NOTE_TAG);
-      if (lang === "en") note.addTag(ENGLISH_NOTE_TAG);
+      if (normalizedMimeType !== mimeType) {
+        logImageNote(
+          `[AI-Butler] Normalize image MIME for embedded note: ${mimeType || "unknown"} -> ${normalizedMimeType}`,
+        );
+      }
+
+      const blob = this.base64ToBlob(imageBase64, normalizedMimeType);
+
+      // 使用官方 API 创建 embedded-image attachment
+      // 这样图片作为独立附件存储，笔记中只保留 data-attachment-key 引用
+      attachment = await Zotero.Attachments.importEmbeddedImage({
+        blob: blob,
+        parentItemID: note.id,
+      });
+
+      logImageNote(
+        `[AI-Butler] 创建图片附件: key=${attachment.key}, noteID=${note.id}`,
+      );
+
+      // 格式化笔记内容（使用 data-attachment-key 引用）
+      const noteContent = this.formatImageNoteContentWithAttachment(
+        itemTitle,
+        attachment.key,
+        lang,
+      );
+
+      // 更新笔记内容
+      note.setNote(noteContent);
       await note.saveTx();
-      ztoolkit.log(`[AI-Butler] 创建新的一图总结笔记: ${note.id}`);
-    } else {
-      note.addTag(this.IMAGE_NOTE_TAG);
-      if (lang === "en") note.addTag(ENGLISH_NOTE_TAG);
+    } catch (error) {
+      if (isUpdate && previousHtml !== null) {
+        try {
+          note?.setNote(previousHtml);
+          if (previousTags) (note as any)?.setTags?.(previousTags);
+        } catch (restoreError) {
+          this.logCleanupFailure(
+            "restore the previous image note",
+            restoreError,
+          );
+        }
+      }
+
+      if (attachment) {
+        await this.eraseAfterFailure(attachment, "new embedded image");
+      }
+      if (!isUpdate && placeholderPersisted && note) {
+        await this.eraseAfterFailure(note, "image-summary placeholder note");
+      }
+      throw error;
     }
 
-    // 将 base64 转换为 Blob
-    const normalizedMimeType = this.normalizeImageMimeTypeForEmbedding(
-      imageBase64,
-      mimeType,
-    );
-    if (normalizedMimeType !== mimeType) {
-      ztoolkit.log(
-        `[AI-Butler] Normalize image MIME for embedded note: ${mimeType || "unknown"} -> ${normalizedMimeType}`,
-      );
-    }
-
-    const blob = this.base64ToBlob(imageBase64, normalizedMimeType);
-
-    // 使用官方 API 创建 embedded-image attachment
-    // 这样图片作为独立附件存储，笔记中只保留 data-attachment-key 引用
-    const attachment = await Zotero.Attachments.importEmbeddedImage({
-      blob: blob,
-      parentItemID: note.id,
-    });
-
-    ztoolkit.log(
-      `[AI-Butler] 创建图片附件: key=${attachment.key}, noteID=${note.id}`,
-    );
-
-    // 格式化笔记内容（使用 data-attachment-key 引用）
-    const noteContent = this.formatImageNoteContentWithAttachment(
-      itemTitle,
-      attachment.key,
-      lang,
-    );
-
-    // 更新笔记内容
-    note.setNote(noteContent);
-    await note.saveTx();
-
-    ztoolkit.log(
+    logImageNote(
       `[AI-Butler] ${isUpdate ? "更新" : "创建"}一图总结笔记完成: ${note.id}`,
     );
     return note;
+  }
+
+  private static async eraseAfterFailure(
+    item: Zotero.Item,
+    label: string,
+  ): Promise<void> {
+    try {
+      await (item as any).eraseTx?.();
+    } catch (error) {
+      this.logCleanupFailure(`erase ${label}`, error);
+    }
+  }
+
+  private static logCleanupFailure(action: string, error: unknown): void {
+    logImageNote(`[AI-Butler] Failed to ${action}:`, error);
   }
 
   /**

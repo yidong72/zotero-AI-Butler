@@ -771,6 +771,22 @@ export class ApiSettingsPage {
     });
     form.appendChild(scheduleTitle);
 
+    const taskRetryInput = this.createInput(
+      "maxRetries",
+      "number",
+      getPref("maxRetries") as string,
+      "3",
+    );
+    taskRetryInput.min = "1";
+    taskRetryInput.max = "5";
+    form.appendChild(
+      this.createFormGroup(
+        "普通 AI 任务连续失败上限",
+        taskRetryInput,
+        "默认 3 次，范围 1-5。适用于 AI 总结、思维导图和一图总结；仅瞬时网络或服务故障会自动重试。",
+      ),
+    );
+
     const deepReadRetryInput = this.createInput(
       "deepReadMaxRetries",
       "number",
@@ -2463,6 +2479,11 @@ export class ApiSettingsPage {
         checkboxValue("enablePromptCacheOptimization", false),
       );
       setPref("requestTimeout", inputValue("requestTimeout", "300000"));
+      const taskRetries = Math.min(
+        5,
+        Math.max(1, parseInt(inputValue("maxRetries", "3"), 10) || 3),
+      );
+      setPref("maxRetries", String(taskRetries));
       const deepReadRetries = Math.min(
         5,
         Math.max(1, parseInt(inputValue("deepReadMaxRetries", "5"), 10) || 5),
@@ -2619,6 +2640,9 @@ export class ApiSettingsPage {
         "#setting-enablePromptCacheOptimization",
       ) as HTMLInputElement;
       // 调度配置
+      const maxRetriesEl = this.container.querySelector(
+        "#setting-maxRetries",
+      ) as HTMLInputElement;
       const deepReadMaxRetriesEl = this.container.querySelector(
         "#setting-deepReadMaxRetries",
       ) as HTMLInputElement;
@@ -2687,6 +2711,12 @@ export class ApiSettingsPage {
               "#setting-requestTimeout",
             ) as HTMLInputElement
           )?.value?.trim() || "300000",
+        maxRetries: String(
+          Math.min(
+            5,
+            Math.max(1, parseInt(maxRetriesEl?.value?.trim() || "3", 10) || 3),
+          ),
+        ),
         deepReadMaxRetries: String(
           Math.min(
             5,
@@ -2811,6 +2841,7 @@ export class ApiSettingsPage {
       );
       setPref("requestTimeout", values.requestTimeout);
       // 调度配置
+      setPref("maxRetries", values.maxRetries);
       setPref("deepReadMaxRetries", values.deepReadMaxRetries);
       setPref("batchSize", values.batchSize);
       setPref("batchInterval", values.batchInterval);
@@ -2826,7 +2857,11 @@ export class ApiSettingsPage {
         "#setting-failedKeyCooldownSeconds",
       ) as HTMLInputElement | null;
       if (maxSwitchEl) {
-        setPref("maxApiSwitchCount" as any, maxSwitchEl.value?.trim() || "3");
+        const maxSwitch = Math.min(
+          5,
+          Math.max(1, parseInt(maxSwitchEl.value?.trim() || "3", 10) || 3),
+        );
+        setPref("maxApiSwitchCount" as any, String(maxSwitch));
       }
       if (cooldownSecsEl) {
         const secs = parseInt(cooldownSecsEl.value?.trim() || "300") || 300;
@@ -3241,6 +3276,7 @@ export class ApiSettingsPage {
     setPref("stream", true);
     setPref("enablePromptCacheOptimization" as any, false);
     setPref("requestTimeout", "300000");
+    setPref("maxRetries", "3");
     setPref("deepReadMaxRetries", "5");
     setPref("batchSize", "1");
     setPref("batchInterval", "60");

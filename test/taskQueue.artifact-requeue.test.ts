@@ -65,6 +65,11 @@ type QueueInternals = {
     artifactType: FixedTaskArtifactType,
     options?: TaskItem["options"],
   ): Promise<boolean>;
+  applyStandardTaskFailure(
+    task: TaskItem,
+    error: unknown,
+  ): { willRetry: boolean; isTaskAborted: boolean };
+  shouldSuppressTaskRetry(error: unknown, task?: TaskItem): boolean;
   saveToStorage(): Promise<void>;
 };
 
@@ -244,7 +249,8 @@ describe("TaskQueue artifact-aware requeue", function () {
     expect(enMindmapId).to.equal(getMindmapTaskId(item.id, "en"));
     expect(manager.tasks.get(enImageId)?.promptLanguage).to.equal("en");
     expect(manager.tasks.get(enMindmapId)?.promptLanguage).to.equal("en");
-    expect(manager.tasks.get(enImageId)?.maxRetries).to.equal(2);
+    expect(manager.tasks.get(enImageId)?.maxRetries).to.equal(3);
+    expect(manager.tasks.get(enMindmapId)?.maxRetries).to.equal(3);
   });
 
   it("recovers English language from legacy persisted task IDs", function () {
@@ -312,6 +318,54 @@ describe("TaskQueue artifact-aware requeue", function () {
     expect(getTaskRetryLimit("deepRead")).to.equal(5);
     Zotero.Prefs.set(deepReadMaxRetriesPref, "invalid", true);
     expect(getTaskRetryLimit("deepRead")).to.equal(5);
+  });
+
+  it("bounds general artifact retry budgets and applies them to image and mindmap", function () {
+    expect(getTaskRetryLimit("summary")).to.equal(3);
+    expect(getTaskRetryLimit("imageSummary")).to.equal(3);
+    expect(getTaskRetryLimit("mindmap")).to.equal(3);
+    Zotero.Prefs.set(maxRetriesPref, "99", true);
+    expect(getTaskRetryLimit("summary")).to.equal(5);
+    expect(getTaskRetryLimit("imageSummary")).to.equal(5);
+  });
+
+  it("schedules exact connection failures and records truthful pending diagnostics", function () {
+    const manager = createQueueInternals();
+    const task = createTask(TaskStatus.PROCESSING);
+    task.taskType = "mindmap";
+    task.retryCount = 0;
+    task.maxRetries = 3;
+
+    const outcome = manager.applyStandardTaskFailure(
+      task,
+      new Error("Error connecting to server. Check your Internet connection."),
+    );
+
+    expect(outcome.willRetry).to.equal(true);
+    expect(task.status).to.equal(TaskStatus.PENDING);
+    expect(task.retryCount).to.equal(1);
+    expect(task.workflowStage).to.include("2/3");
+    expect(task.completedAt).to.equal(undefined);
+    expect(task.errorDetails).to.include("status: pending");
+    expect(task.errorDetails).to.include("retryCount: 1");
+    expect(task.errorDetails).to.include("failureKind: network");
+  });
+
+  it("does not fabricate a queue retry for terminal content-length failures", function () {
+    const manager = createQueueInternals();
+    const task = createTask(TaskStatus.PROCESSING);
+    task.taskType = "imageSummary";
+    task.retryCount = 0;
+    task.maxRetries = 3;
+    const noisy =
+      'None: {"error":{"code":"content_length_limit","message":"Request content length exceeded 32 MB limit."}}No fallback model group found';
+
+    const outcome = manager.applyStandardTaskFailure(task, new Error(noisy));
+
+    expect(outcome.willRetry).to.equal(false);
+    expect(task.status).to.equal(TaskStatus.FAILED);
+    expect(task.retryCount).to.equal(0);
+    expect(task.errorDetails).to.include("failureKind: payload-too-large");
   });
 
   it("reports retry and final deep-read states without false requeue claims", function () {

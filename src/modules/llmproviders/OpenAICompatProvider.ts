@@ -25,6 +25,48 @@ import {
   throwIfAborted,
 } from "./shared/requestAbort";
 
+function logOpenAICompat(...args: Parameters<ZToolkit["log"]>): void {
+  try {
+    if (typeof ztoolkit !== "undefined") ztoolkit.log(...args);
+  } catch {
+    // Logging is best-effort.
+  }
+}
+
+function hasChatCompletionFinishReason(event: any): boolean {
+  return event?.choices?.some(
+    (choice: any) =>
+      choice?.finish_reason !== undefined && choice?.finish_reason !== null,
+  );
+}
+
+function createInterruptedChatCompletionError(label: string): Error {
+  return new Error(
+    `${label} stream ended before a terminal completion marker was received.`,
+  );
+}
+
+function consumeChatCompletionSseLine(
+  rawLine: string,
+  onEvent: (event: any) => void,
+  onTerminal: () => void,
+): void {
+  if (rawLine.indexOf("data:") !== 0) return;
+  const jsonStr = rawLine.replace(/^data:\s*/, "").trim();
+  if (!jsonStr) return;
+  if (jsonStr === "[DONE]") {
+    onTerminal();
+    return;
+  }
+  try {
+    const event = JSON.parse(jsonStr);
+    if (hasChatCompletionFinishReason(event)) onTerminal();
+    onEvent(event);
+  } catch {
+    /* ignore malformed SSE lines */
+  }
+}
+
 /**
  * OpenAI 旧接口兼容 Provider（Chat Completions 格式）
  *
@@ -155,8 +197,34 @@ export class OpenAICompatProvider implements ILlmProvider {
       let processedLength = 0;
       let partialLine = "";
       let gotAnyDelta = false;
+      let streamComplete = false;
       let abortError: Error | null = null;
       let cleanupAbortSignal: (() => void) | undefined;
+      const consumeLine = (rawLine: string): void => {
+        consumeChatCompletionSseLine(
+          rawLine,
+          (event) => {
+            const delta = event?.choices?.[0]?.delta?.content;
+            if (typeof delta !== "string" || delta.length === 0) return;
+            gotAnyDelta = true;
+            chunks.push(delta);
+            const current = chunks.join("");
+            if (onProgress && current.length > delivered) {
+              const newChunk = current.slice(delivered);
+              delivered = current.length;
+              Promise.resolve(onProgress(newChunk)).catch((err) =>
+                logOpenAICompat(
+                  "[AI-Butler] onProgress error (OpenAI Compat SSE):",
+                  err,
+                ),
+              );
+            }
+          },
+          () => {
+            streamComplete = true;
+          },
+        );
+      };
 
       try {
         await Zotero.HTTP.request("POST", apiUrl, {
@@ -205,35 +273,13 @@ export class OpenAICompatProvider implements ILlmProvider {
                       ? ""
                       : parts.pop() || "";
 
-                  for (const raw of parts) {
-                    if (raw.indexOf("data:") !== 0) continue;
-                    const jsonStr = raw.replace(/^data:\s*/, "").trim();
-                    if (!jsonStr || jsonStr === "[DONE]") continue;
-                    try {
-                      const evt = JSON.parse(jsonStr);
-                      const delta = evt?.choices?.[0]?.delta?.content;
-                      if (typeof delta === "string" && delta.length > 0) {
-                        gotAnyDelta = true;
-                        chunks.push(delta);
-                        const current = chunks.join("");
-                        if (onProgress && current.length > delivered) {
-                          const newChunk = current.slice(delivered);
-                          delivered = current.length;
-                          Promise.resolve(onProgress(newChunk)).catch((err) =>
-                            ztoolkit.log(
-                              "[AI-Butler] onProgress error (OpenAI Compat SSE):",
-                              err,
-                            ),
-                          );
-                        }
-                      }
-                    } catch {
-                      /* ignore */
-                    }
-                  }
+                  for (const raw of parts) consumeLine(raw);
                 }
               } catch (err) {
-                ztoolkit.log("[AI-Butler] OpenAI Compat SSE parse error:", err);
+                logOpenAICompat(
+                  "[AI-Butler] OpenAI Compat SSE parse error:",
+                  err,
+                );
               }
             };
             xmlhttp.onerror = () => {
@@ -253,7 +299,7 @@ export class OpenAICompatProvider implements ILlmProvider {
           if (isAbortError(abortError, options.abortSignal)) {
             throw normalizeAbortError(abortError, options.abortSignal);
           }
-          if (gotAnyDelta && chunks.length > 0) return chunks.join("");
+          if (streamComplete) return chunks.join("");
           throw abortError;
         }
         if (isAbortError(error, options.abortSignal)) {
@@ -276,13 +322,22 @@ export class OpenAICompatProvider implements ILlmProvider {
         } catch {
           /* ignore */
         }
-        if (gotAnyDelta && chunks.length > 0) return chunks.join("");
+        if (streamComplete) return chunks.join("");
         throw new Error(errorMessage);
       } finally {
         cleanupAbortSignal?.();
       }
 
-      return chunks.join("");
+      if (partialLine) {
+        consumeLine(partialLine);
+        partialLine = "";
+      }
+
+      if (streamComplete) return chunks.join("");
+      if (gotAnyDelta) {
+        throw createInterruptedChatCompletionError("OpenAI Compat summary");
+      }
+      return "";
     }
 
     // 非流式
@@ -394,9 +449,38 @@ export class OpenAICompatProvider implements ILlmProvider {
     let processedLength = 0;
     let partialLine = "";
     let gotAnyDelta = false;
+    let streamComplete = false;
     let lastUsage: any;
     let abortError: Error | null = null;
     let cleanupAbortSignal: (() => void) | undefined;
+    const consumeLine = (rawLine: string): void => {
+      consumeChatCompletionSseLine(
+        rawLine,
+        (event) => {
+          if (options.enablePromptCache && event?.usage) {
+            lastUsage = event.usage;
+          }
+          const delta = event?.choices?.[0]?.delta?.content;
+          if (typeof delta !== "string" || delta.length === 0) return;
+          gotAnyDelta = true;
+          chunks.push(delta);
+          const current = chunks.join("");
+          if (onProgress && current.length > delivered) {
+            const newChunk = current.slice(delivered);
+            delivered = current.length;
+            Promise.resolve(onProgress(newChunk)).catch((err) =>
+              logOpenAICompat(
+                "[AI-Butler] onProgress error (OpenAI Compat chat SSE):",
+                err,
+              ),
+            );
+          }
+        },
+        () => {
+          streamComplete = true;
+        },
+      );
+    };
 
     try {
       await Zotero.HTTP.request("POST", apiUrl, {
@@ -443,38 +527,10 @@ export class OpenAICompatProvider implements ILlmProvider {
                     ? ""
                     : parts.pop() || "";
 
-                for (const raw of parts) {
-                  if (raw.indexOf("data:") !== 0) continue;
-                  const jsonStr = raw.replace(/^data:\s*/, "").trim();
-                  if (!jsonStr || jsonStr === "[DONE]") continue;
-                  try {
-                    const evt = JSON.parse(jsonStr);
-                    if (options.enablePromptCache && evt?.usage) {
-                      lastUsage = evt.usage;
-                    }
-                    const delta = evt?.choices?.[0]?.delta?.content;
-                    if (typeof delta === "string" && delta.length > 0) {
-                      gotAnyDelta = true;
-                      chunks.push(delta);
-                      const current = chunks.join("");
-                      if (onProgress && current.length > delivered) {
-                        const newChunk = current.slice(delivered);
-                        delivered = current.length;
-                        Promise.resolve(onProgress(newChunk)).catch((err) =>
-                          ztoolkit.log(
-                            "[AI-Butler] onProgress error (OpenAI Compat chat SSE):",
-                            err,
-                          ),
-                        );
-                      }
-                    }
-                  } catch {
-                    /* ignore */
-                  }
-                }
+                for (const raw of parts) consumeLine(raw);
               }
             } catch (err) {
-              ztoolkit.log(
+              logOpenAICompat(
                 "[AI-Butler] OpenAI Compat chat SSE parse error:",
                 err,
               );
@@ -497,7 +553,7 @@ export class OpenAICompatProvider implements ILlmProvider {
         if (isAbortError(abortError, options.abortSignal)) {
           throw normalizeAbortError(abortError, options.abortSignal);
         }
-        if (gotAnyDelta && chunks.length > 0) return chunks.join("");
+        if (streamComplete) return chunks.join("");
         throw abortError;
       }
       if (isAbortError(error, options.abortSignal)) {
@@ -520,16 +576,25 @@ export class OpenAICompatProvider implements ILlmProvider {
       } catch {
         /* ignore */
       }
-      if (gotAnyDelta && chunks.length > 0) return chunks.join("");
+      if (streamComplete) return chunks.join("");
       throw new Error(errorMessage);
     } finally {
       cleanupAbortSignal?.();
     }
 
+    if (partialLine) {
+      consumeLine(partialLine);
+      partialLine = "";
+    }
+
     if (options.enablePromptCache) {
       logPromptCacheUsage("OpenAI-Compat chat", lastUsage);
     }
-    return chunks.join("");
+    if (streamComplete) return chunks.join("");
+    if (gotAnyDelta) {
+      throw createInterruptedChatCompletionError("OpenAI Compat chat");
+    }
+    return "";
   }
 
   async listModels(options: LLMOptions): Promise<LLMModelInfo[]> {
@@ -700,11 +765,11 @@ export class OpenAICompatProvider implements ILlmProvider {
             pdfFile.displayName || `document_${i + 1}.pdf`,
           ),
         );
-        ztoolkit.log(
+        logOpenAICompat(
           `[AI-Butler] 添加 PDF 附件 (${i + 1}/${pdfFiles.length}): ${pdfFile.displayName}, base64 长度: ${pdfFile.base64Content.length}`,
         );
       } else {
-        ztoolkit.log(
+        logOpenAICompat(
           `[AI-Butler] PDF 文件 ${pdfFile.displayName} 无 base64 内容，跳过`,
         );
       }
@@ -714,7 +779,7 @@ export class OpenAICompatProvider implements ILlmProvider {
       throw new Error("没有成功处理任何 PDF 文件");
     }
 
-    ztoolkit.log(
+    logOpenAICompat(
       `[AI-Butler] 准备发送 ${fileParts.length} 个 PDF 附件到 OpenAI 兼容接口`,
     );
 
@@ -740,8 +805,34 @@ export class OpenAICompatProvider implements ILlmProvider {
     let processedLength = 0;
     let partialLine = "";
     let gotAnyDelta = false;
+    let streamComplete = false;
     let abortError: Error | null = null;
     let cleanupAbortSignal: (() => void) | undefined;
+    const consumeLine = (rawLine: string): void => {
+      consumeChatCompletionSseLine(
+        rawLine,
+        (event) => {
+          const delta = event?.choices?.[0]?.delta?.content;
+          if (typeof delta !== "string" || delta.length === 0) return;
+          gotAnyDelta = true;
+          chunks.push(delta);
+          const current = chunks.join("");
+          if (onProgress && current.length > delivered) {
+            const newChunk = current.slice(delivered);
+            delivered = current.length;
+            Promise.resolve(onProgress(newChunk)).catch((err) =>
+              logOpenAICompat(
+                "[AI-Butler] onProgress error (OpenAI Compat multi-PDF):",
+                err,
+              ),
+            );
+          }
+        },
+        () => {
+          streamComplete = true;
+        },
+      );
+    };
 
     try {
       await Zotero.HTTP.request("POST", apiUrl, {
@@ -788,35 +879,10 @@ export class OpenAICompatProvider implements ILlmProvider {
                     ? ""
                     : parts.pop() || "";
 
-                for (const raw of parts) {
-                  if (raw.indexOf("data:") !== 0) continue;
-                  const jsonStr = raw.replace(/^data:\s*/, "").trim();
-                  if (!jsonStr || jsonStr === "[DONE]") continue;
-                  try {
-                    const evt = JSON.parse(jsonStr);
-                    const delta = evt?.choices?.[0]?.delta?.content;
-                    if (typeof delta === "string" && delta.length > 0) {
-                      gotAnyDelta = true;
-                      chunks.push(delta);
-                      const current = chunks.join("");
-                      if (onProgress && current.length > delivered) {
-                        const newChunk = current.slice(delivered);
-                        delivered = current.length;
-                        Promise.resolve(onProgress(newChunk)).catch((err) =>
-                          ztoolkit.log(
-                            "[AI-Butler] onProgress error (OpenAI Compat multi-PDF):",
-                            err,
-                          ),
-                        );
-                      }
-                    }
-                  } catch {
-                    /* ignore */
-                  }
-                }
+                for (const raw of parts) consumeLine(raw);
               }
             } catch (err) {
-              ztoolkit.log(
+              logOpenAICompat(
                 "[AI-Butler] OpenAI Compat multi-PDF SSE parse error:",
                 err,
               );
@@ -839,7 +905,7 @@ export class OpenAICompatProvider implements ILlmProvider {
         if (isAbortError(abortError, options.abortSignal)) {
           throw normalizeAbortError(abortError, options.abortSignal);
         }
-        if (gotAnyDelta && chunks.length > 0) return chunks.join("");
+        if (streamComplete) return chunks.join("");
         throw abortError;
       }
       if (isAbortError(error, options.abortSignal)) {
@@ -862,14 +928,22 @@ export class OpenAICompatProvider implements ILlmProvider {
       } catch {
         /* ignore */
       }
-      if (gotAnyDelta && chunks.length > 0) return chunks.join("");
+      if (streamComplete) return chunks.join("");
       throw new Error(errorMessage);
     } finally {
       cleanupAbortSignal?.();
     }
 
+    if (partialLine) {
+      consumeLine(partialLine);
+      partialLine = "";
+    }
+
     const streamed = chunks.join("");
-    if (gotAnyDelta && streamed) return streamed;
+    if (streamComplete) return streamed;
+    if (gotAnyDelta) {
+      throw createInterruptedChatCompletionError("OpenAI Compat multi-PDF");
+    }
     return "";
   }
 }

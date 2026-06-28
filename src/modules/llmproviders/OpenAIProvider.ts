@@ -30,6 +30,40 @@ import {
   throwIfAborted,
 } from "./shared/requestAbort";
 
+function hasChatCompletionFinishReason(event: any): boolean {
+  return event?.choices?.some(
+    (choice: any) =>
+      choice?.finish_reason !== undefined && choice?.finish_reason !== null,
+  );
+}
+
+function createInterruptedChatCompletionError(label: string): Error {
+  return new Error(
+    `${label} stream ended before a terminal completion marker was received.`,
+  );
+}
+
+function consumeChatCompletionSseLine(
+  rawLine: string,
+  onEvent: (event: any) => void,
+  onTerminal: () => void,
+): void {
+  if (rawLine.indexOf("data:") !== 0) return;
+  const jsonStr = rawLine.replace(/^data:\s*/, "").trim();
+  if (!jsonStr) return;
+  if (jsonStr === "[DONE]") {
+    onTerminal();
+    return;
+  }
+  try {
+    const event = JSON.parse(jsonStr);
+    if (hasChatCompletionFinishReason(event)) onTerminal();
+    onEvent(event);
+  } catch {
+    /* ignore malformed SSE lines */
+  }
+}
+
 export class OpenAIProvider implements ILlmProvider {
   readonly id = "openai";
   readonly capabilities: LLMProviderCapabilities = {
@@ -308,6 +342,28 @@ export class OpenAIProvider implements ILlmProvider {
       let abortedDueToError = false;
       let errorFromProgress: Error | null = null;
       let cleanupAbortSignal: (() => void) | undefined;
+      const consumeLine = (rawLine: string): void => {
+        consumeChatCompletionSseLine(
+          rawLine,
+          (event) => {
+            const delta = event?.choices?.[0]?.delta?.content;
+            if (typeof delta !== "string" || delta.length === 0) return;
+            gotAnyDelta = true;
+            chunks.push(delta);
+            const current = chunks.join("");
+            if (onProgress && current.length > delivered) {
+              const newChunk = current.slice(delivered);
+              delivered = current.length;
+              Promise.resolve(onProgress(newChunk)).catch((err) =>
+                ztoolkit.log("[AI-Butler] onProgress callback error:", err),
+              );
+            }
+          },
+          () => {
+            streamComplete = true;
+          },
+        );
+      };
 
       try {
         await Zotero.HTTP.request("POST", apiUrl, {
@@ -364,35 +420,7 @@ export class OpenAIProvider implements ILlmProvider {
                       ? ""
                       : parts.pop() || "";
 
-                  for (const raw of parts) {
-                    if (raw.indexOf("data: ") !== 0) continue;
-                    const jsonStr = raw.replace(/^data:\s*/, "").trim();
-                    if (jsonStr === "[DONE]") {
-                      streamComplete = true;
-                      return;
-                    }
-                    try {
-                      const json = JSON.parse(jsonStr);
-                      const delta = json?.choices?.[0]?.delta?.content;
-                      if (typeof delta === "string" && delta.length > 0) {
-                        gotAnyDelta = true;
-                        chunks.push(delta);
-                        const current = chunks.join("");
-                        if (onProgress && current.length > delivered) {
-                          const newChunk = current.slice(delivered);
-                          delivered = current.length;
-                          Promise.resolve(onProgress(newChunk)).catch((err) =>
-                            ztoolkit.log(
-                              "[AI-Butler] onProgress callback error:",
-                              err,
-                            ),
-                          );
-                        }
-                      }
-                    } catch {
-                      /* ignore */
-                    }
-                  }
+                  for (const raw of parts) consumeLine(raw);
                 }
               } catch (err) {
                 ztoolkit.log("[AI-Butler] stream parse error:", err);
@@ -427,9 +455,8 @@ export class OpenAIProvider implements ILlmProvider {
             options.abortSignal,
           );
         }
+        if (streamComplete) return chunks.join("");
         if (abortedDueToError && errorFromProgress) throw errorFromProgress;
-        if (streamComplete && gotAnyDelta) return chunks.join("");
-        if (gotAnyDelta && chunks.length > 0) return chunks.join("");
         let errorMessage = "未知错误";
         try {
           const responseText =
@@ -452,8 +479,18 @@ export class OpenAIProvider implements ILlmProvider {
         cleanupAbortSignal?.();
       }
 
+      if (partialLine) {
+        consumeLine(partialLine);
+        partialLine = "";
+      }
+
       const streamed = chunks.join("");
-      if (gotAnyDelta && streamed) return streamed;
+      if (streamComplete) return streamed;
+      if (gotAnyDelta) {
+        throw createInterruptedChatCompletionError(
+          "OpenAI Chat Completions summary",
+        );
+      }
 
       // 回退非流式
       return await this.nonStreamCompletion(
@@ -761,7 +798,30 @@ export class OpenAIProvider implements ILlmProvider {
     let partialLine = "";
     let abortError: Error | null = null;
     let gotAnyDelta = false;
+    let streamComplete = false;
     let cleanupAbortSignal: (() => void) | undefined;
+    const consumeLine = (rawLine: string): void => {
+      consumeChatCompletionSseLine(
+        rawLine,
+        (event) => {
+          const delta = event?.choices?.[0]?.delta?.content;
+          if (typeof delta !== "string" || delta.length === 0) return;
+          gotAnyDelta = true;
+          chunks.push(delta);
+          const current = chunks.join("");
+          if (onProgress && current.length > delivered) {
+            const newChunk = current.slice(delivered);
+            delivered = current.length;
+            Promise.resolve(onProgress(newChunk)).catch((err) => {
+              ztoolkit.log("[AI-Butler] onProgress error:", err);
+            });
+          }
+        },
+        () => {
+          streamComplete = true;
+        },
+      );
+    };
 
     try {
       await Zotero.HTTP.request("POST", apiUrl, {
@@ -823,30 +883,7 @@ export class OpenAIProvider implements ILlmProvider {
                     ? ""
                     : parts.pop() || "";
 
-                for (const raw of parts) {
-                  if (raw.indexOf("data:") !== 0) continue;
-                  const jsonStr = raw.replace(/^data:\s*/, "").trim();
-                  if (jsonStr === "[DONE]") continue;
-                  if (!jsonStr) continue;
-                  try {
-                    const json = JSON.parse(jsonStr);
-                    const delta = json?.choices?.[0]?.delta?.content;
-                    if (delta) {
-                      gotAnyDelta = true;
-                      chunks.push(delta);
-                      const current = chunks.join("");
-                      if (onProgress && current.length > delivered) {
-                        const newChunk = current.slice(delivered);
-                        delivered = current.length;
-                        Promise.resolve(onProgress(newChunk)).catch((err) => {
-                          ztoolkit.log("[AI-Butler] onProgress error:", err);
-                        });
-                      }
-                    }
-                  } catch {
-                    /* ignore */
-                  }
-                }
+                for (const raw of parts) consumeLine(raw);
               }
             } catch (err) {
               ztoolkit.log("[AI-Butler] OpenAI stream parse error:", err);
@@ -869,9 +906,7 @@ export class OpenAIProvider implements ILlmProvider {
         if (isAbortError(abortError, options.abortSignal)) {
           throw normalizeAbortError(abortError, options.abortSignal);
         }
-        if (gotAnyDelta && chunks.length > 0) {
-          return chunks.join("");
-        }
+        if (streamComplete) return chunks.join("");
         throw abortError;
       }
       if (isAbortError(error, options.abortSignal)) {
@@ -899,13 +934,24 @@ export class OpenAIProvider implements ILlmProvider {
         statusText: error?.xmlhttp?.statusText,
         message: errorMessage,
       });
-      if (gotAnyDelta && chunks.length > 0) return chunks.join("");
+      if (streamComplete) return chunks.join("");
       throw new Error(errorMessage);
     } finally {
       cleanupAbortSignal?.();
     }
 
-    return chunks.join("");
+    if (partialLine) {
+      consumeLine(partialLine);
+      partialLine = "";
+    }
+
+    if (streamComplete) return chunks.join("");
+    if (gotAnyDelta) {
+      throw createInterruptedChatCompletionError(
+        "OpenAI Chat Completions chat",
+      );
+    }
+    return "";
   }
 
   async listModels(options: LLMOptions): Promise<LLMModelInfo[]> {

@@ -34,6 +34,7 @@ import {
   LLM_REQUEST_ABORT_MESSAGE,
   isAbortError,
 } from "./llmproviders/shared/requestAbort";
+import { classifyRequestFailure } from "./llmproviders/shared/requestFailure";
 import { TaskArtifacts, type FixedTaskArtifactType } from "./taskArtifacts";
 import { isTableFeatureEnabled } from "./uiCustomization";
 import { AiNoteService } from "./aiNoteService";
@@ -135,11 +136,11 @@ export type TaskType =
 
 export const DEFAULT_DEEP_READ_TASK_MAX_RETRIES = 5;
 const MAX_DEEP_READ_TASK_RETRIES = 5;
+const DEFAULT_TASK_MAX_RETRIES = 3;
+const MAX_TASK_RETRIES = 5;
 
 export function getTaskRetryLimit(taskType?: TaskType): number {
   const fixedLimit =
-    taskType === "imageSummary" ||
-    taskType === "mindmap" ||
     taskType === "tableFill"
       ? 2
       : taskType === "review" || taskType === "targetedQuestion"
@@ -164,7 +165,13 @@ export function getTaskRetryLimit(taskType?: TaskType): number {
   }
 
   const configured = parseInt(String(getPref("maxRetries") || ""), 10);
-  return Math.max(1, Number.isFinite(configured) ? configured : 3);
+  return Math.min(
+    MAX_TASK_RETRIES,
+    Math.max(
+      1,
+      Number.isFinite(configured) ? configured : DEFAULT_TASK_MAX_RETRIES,
+    ),
+  );
 }
 
 export function inferTaskType(task: {
@@ -1017,26 +1024,20 @@ export class TaskQueueManager {
       logTaskQueue(`一图总结任务完成: ${task.title} (耗时${task.duration}秒)`);
       this.notifyComplete(taskId, true);
     } catch (error: any) {
-      // 任务失败
-      task.error = this.getTaskErrorMessage(error);
-      task.errorDetails = this.buildTaskErrorDetails(task, error);
-      task.workflowStage = "失败";
-      const suppressTaskRetry = this.shouldSuppressTaskRetry(error, task);
-
-      task.retryCount++;
-      if (!suppressTaskRetry && task.retryCount < task.maxRetries) {
-        task.status = TaskStatus.PENDING;
-        task.progress = 0;
+      const { willRetry } = this.applyStandardTaskFailure(
+        task,
+        error,
+        abortController.signal,
+      );
+      if (willRetry) {
         logTaskQueue(
           `一图总结任务失败,将重试 (${task.retryCount}/${task.maxRetries}): ${task.title}`,
         );
+        this.notifyProgress(taskId, 0, task.workflowStage || "等待自动重试");
       } else {
-        task.status = TaskStatus.FAILED;
-        task.completedAt = new Date();
         logTaskQueue(`一图总结任务最终失败: ${task.title} - ${task.error}`);
+        this.notifyComplete(taskId, false, task.error);
       }
-
-      this.notifyComplete(taskId, false, task.error);
     } finally {
       this.processingTasks.delete(taskId);
       this.taskAbortControllers.delete(taskId);
@@ -1196,26 +1197,20 @@ export class TaskQueueManager {
       logTaskQueue(`思维导图任务完成: ${task.title} (耗时${task.duration}秒)`);
       this.notifyComplete(taskId, true);
     } catch (error: any) {
-      // 任务失败
-      task.error = this.getTaskErrorMessage(error);
-      task.errorDetails = this.buildTaskErrorDetails(task, error);
-      task.workflowStage = "失败";
-      const suppressTaskRetry = this.shouldSuppressTaskRetry(error, task);
-
-      task.retryCount++;
-      if (!suppressTaskRetry && task.retryCount < task.maxRetries) {
-        task.status = TaskStatus.PENDING;
-        task.progress = 0;
+      const { willRetry } = this.applyStandardTaskFailure(
+        task,
+        error,
+        abortController.signal,
+      );
+      if (willRetry) {
         logTaskQueue(
           `思维导图任务失败,将重试 (${task.retryCount}/${task.maxRetries}): ${task.title}`,
         );
+        this.notifyProgress(taskId, 0, task.workflowStage || "等待自动重试");
       } else {
-        task.status = TaskStatus.FAILED;
-        task.completedAt = new Date();
         logTaskQueue(`思维导图任务最终失败: ${task.title} - ${task.error}`);
+        this.notifyComplete(taskId, false, task.error);
       }
-
-      this.notifyComplete(taskId, false, task.error);
     } finally {
       this.processingTasks.delete(taskId);
       this.taskAbortControllers.delete(taskId);
@@ -1397,19 +1392,16 @@ export class TaskQueueManager {
       logTaskQueue(`填表任务完成: ${task.title} (耗时${task.duration}秒)`);
       this.notifyComplete(taskId, true);
     } catch (error: any) {
-      task.error = this.getTaskErrorMessage(error);
-      task.errorDetails = this.buildTaskErrorDetails(task, error);
-      task.workflowStage = "失败";
-      const suppressTaskRetry = this.shouldSuppressTaskRetry(error, task);
-      task.retryCount++;
-      if (!suppressTaskRetry && task.retryCount < task.maxRetries) {
-        task.status = TaskStatus.PENDING;
-        task.progress = 0;
+      const { willRetry } = this.applyStandardTaskFailure(
+        task,
+        error,
+        abortController.signal,
+      );
+      if (willRetry) {
+        this.notifyProgress(taskId, 0, task.workflowStage || "等待自动重试");
       } else {
-        task.status = TaskStatus.FAILED;
-        task.completedAt = new Date();
+        this.notifyComplete(taskId, false, task.error);
       }
-      this.notifyComplete(taskId, false, task.error);
     } finally {
       this.processingTasks.delete(taskId);
       this.taskAbortControllers.delete(taskId);
@@ -2388,18 +2380,36 @@ export class TaskQueueManager {
       task.error = isTaskAborted
         ? LLM_REQUEST_ABORT_MESSAGE
         : this.getTaskErrorMessage(error);
-      task.errorDetails = isTaskAborted
-        ? TASK_ABORT_DETAIL
-        : this.buildTaskErrorDetails(task, error);
       const suppressTaskRetry = this.shouldSuppressTaskRetry(error, task);
       const deepReadIncompleteReason = (error as any)
         ?.deepReadIncompleteReason as string | undefined;
+      let deepReadMadeProgress =
+        isDeepReadTask && (error as any)?.deepReadMadeProgress === true;
+      if (isDeepReadTask && !deepReadMadeProgress) {
+        try {
+          const item = await Zotero.Items.getAsync(task.itemId);
+          const currentNote = item
+            ? await AiNoteService.findNote(
+                item,
+                "deepRead",
+                task.promptLanguage,
+              )
+            : null;
+          deepReadMadeProgress =
+            countCompletedDeepReadSlots(
+              ((currentNote as any)?.getNote?.() as string) || "",
+            ) > completedDeepReadSlotsBefore;
+        } catch {
+          // Progress detection is best-effort; the original failure is primary.
+        }
+      }
 
       // 无 PDF 附件错误直接标记失败，不重试（用户需要手动添加 PDF）
       const isNoPdfError = task.error === NO_PDF_ERROR_MSG;
       if (isTaskAborted || isNoPdfError || suppressTaskRetry) {
         task.status = TaskStatus.FAILED;
         task.completedAt = new Date();
+        task.workflowStage = isTaskAborted ? "已终止" : "失败";
         logTaskQueue(
           isTaskAborted
             ? `任务已终止: ${task.title}`
@@ -2408,14 +2418,15 @@ export class TaskQueueManager {
               : `任务失败（API 尝试已用尽，不再进行队列重试）: ${task.title}`,
         );
       } else {
-        const deepReadMadeProgress =
-          isDeepReadTask && (error as any)?.deepReadMadeProgress === true;
         task.retryCount = deepReadMadeProgress ? 0 : task.retryCount + 1;
         // 检查是否需要重试
         if (deepReadMadeProgress || task.retryCount < task.maxRetries) {
           // 重置为待处理状态,等待重试
           task.status = TaskStatus.PENDING;
           task.progress = 0;
+          task.completedAt = undefined;
+          task.duration = undefined;
+          task.workflowStage = `等待自动重试（第 ${task.retryCount + 1}/${task.maxRetries} 次尝试）`;
           if (deepReadIncompleteReason) {
             task.error = formatDeepReadIncompleteTaskError(
               deepReadIncompleteReason,
@@ -2434,6 +2445,7 @@ export class TaskQueueManager {
           // 超过最大重试次数,标记为失败
           task.status = TaskStatus.FAILED;
           task.completedAt = new Date();
+          task.workflowStage = "失败";
           if (deepReadIncompleteReason) {
             task.error = formatDeepReadIncompleteTaskError(
               deepReadIncompleteReason,
@@ -2447,11 +2459,14 @@ export class TaskQueueManager {
         }
       }
 
-      if (deepReadIncompleteReason) {
-        task.errorDetails = this.buildTaskErrorDetails(task, error, task.error);
+      task.errorDetails = isTaskAborted
+        ? TASK_ABORT_DETAIL
+        : this.buildTaskErrorDetails(task, error, task.error);
+      if (task.status === TaskStatus.PENDING) {
+        this.notifyProgress(taskId, 0, task.workflowStage || "等待自动重试");
+      } else {
+        this.notifyComplete(taskId, false, task.error);
       }
-
-      this.notifyComplete(taskId, false, task.error);
       this.notifyStream(taskId, { type: "error" });
       return isNoPdfError; // 无 PDF 错误时返回 true，表示快速失败
     } finally {
@@ -2477,6 +2492,40 @@ export class TaskQueueManager {
     );
   }
 
+  private applyStandardTaskFailure(
+    task: TaskItem,
+    error: unknown,
+    abortSignal?: LLMAbortSignal,
+  ): { willRetry: boolean; isTaskAborted: boolean } {
+    const isTaskAborted =
+      this.abortingTasks.has(task.id) ||
+      abortSignal?.aborted === true ||
+      isAbortError(error, abortSignal);
+    task.error = isTaskAborted
+      ? LLM_REQUEST_ABORT_MESSAGE
+      : this.getTaskErrorMessage(error);
+    const suppressTaskRetry =
+      isTaskAborted || this.shouldSuppressTaskRetry(error, task);
+
+    if (!suppressTaskRetry) task.retryCount++;
+    const willRetry = !suppressTaskRetry && task.retryCount < task.maxRetries;
+    if (willRetry) {
+      task.status = TaskStatus.PENDING;
+      task.progress = 0;
+      task.completedAt = undefined;
+      task.duration = undefined;
+      task.workflowStage = `等待自动重试（第 ${task.retryCount + 1}/${task.maxRetries} 次尝试）`;
+    } else {
+      task.status = TaskStatus.FAILED;
+      task.completedAt = new Date();
+      task.workflowStage = isTaskAborted ? "已终止" : "失败";
+    }
+    task.errorDetails = isTaskAborted
+      ? TASK_ABORT_DETAIL
+      : this.buildTaskErrorDetails(task, error);
+    return { willRetry, isTaskAborted };
+  }
+
   private shouldSuppressTaskRetry(error: unknown, task?: TaskItem): boolean {
     const value = error as
       | {
@@ -2484,15 +2533,27 @@ export class TaskQueueManager {
           suppressTaskRetry?: boolean;
         }
       | undefined;
+    if (typeof value?.suppressTaskRetry === "boolean") {
+      return value.suppressTaskRetry;
+    }
+    const failure = classifyRequestFailure(error);
+    if (failure.retryable) return false;
+    if (
+      failure.kind === "abort" ||
+      failure.kind === "payload-too-large" ||
+      failure.kind === "permanent"
+    ) {
+      return true;
+    }
     return (
-      value?.suppressTaskRetry === true ||
       value?.name === "LLMApiCallError" ||
       value?.name === "LLMApiExhaustedError" ||
-      this.isLikelyApiFailure(error, task)
+      value?.name === "LLMRequestTooLargeError"
     );
   }
 
   private isLikelyApiFailure(error: unknown, task?: TaskItem): boolean {
+    if (classifyRequestFailure(error).kind !== "unknown") return true;
     const message = this.getTaskErrorMessage(error);
     const stack =
       typeof (error as { stack?: unknown })?.stack === "string"
@@ -2550,6 +2611,7 @@ export class TaskQueueManager {
           diagnosticText?: string;
           details?: unknown;
           attempts?: number;
+          failureKind?: string;
           endpointId?: string;
           endpointName?: string;
           providerId?: string;
@@ -2572,6 +2634,7 @@ export class TaskQueueManager {
       `platform: ${runtime.platform || "unknown"}`,
       `userAgent: ${runtime.userAgent || "unknown"}`,
       `errorName: ${errorInfo?.name || "unknown"}`,
+      `failureKind: ${errorInfo?.failureKind || classifyRequestFailure(error).kind}`,
       `errorMessage: ${errorMessageOverride || this.getTaskErrorMessage(error)}`,
       `suppressTaskRetry: ${this.shouldSuppressTaskRetry(error, task)}`,
       `likelyApiFailure: ${this.isLikelyApiFailure(error, task)}`,
